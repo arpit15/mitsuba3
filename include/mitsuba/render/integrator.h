@@ -335,6 +335,24 @@ protected:
     bool m_hide_emitters;
 };
 
+// template <typename Float, typename Spectrum>
+// class MI_EXPORT_LIB _SPPMIntegrator : public Integrator<Float, Spectrum> {
+// public:
+//     MI_IMPORT_BASE(Integrator, should_stop, aov_names,
+//                     m_stop, m_timeout, m_render_timer, m_hide_emitters)
+//     MI_IMPORT_TYPES(Scene, Sensor, Film, ImageBlock, Medium, Sampler)
+//     TensorXf render(Scene *scene,
+//                             Sensor *sensor,
+//                             uint32_t seed = 0,
+//                             uint32_t spp = 0,
+//                             bool develop = true,
+//                             bool evaluate = true) override;
+//     MI_DECLARE_CLASS()
+// protected:
+//     _SPPMIntegrator(const Properties &props);
+    
+// };
+
 /** \brief Abstract integrator that performs Monte Carlo sampling starting from
  * the sensor
  *
