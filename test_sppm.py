@@ -8,7 +8,8 @@ from ipdb import set_trace
 logger = mi.Thread.thread().logger()
 logger.set_log_level(mi.LogLevel.Debug)
 
-model_fn = "tutorials/scenes/cbox.xml"
+# model_fn = "tutorials/scenes/cbox.xml"
+model_fn = "docs/resources/data/scenes/cbox/cbox.xml"
 
 scene = mi.load_file(model_fn, integrator="sppm")
 img = mi.render(scene, spp=1)

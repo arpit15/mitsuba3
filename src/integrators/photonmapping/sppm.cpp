@@ -84,6 +84,7 @@ template <typename Float, typename Spectrum>
 struct SPPMPixelListNode {
     SPPMPixel<Float, Spectrum> *pixel;
     SPPMPixelListNode *next;
+    SPPMPixelListNode() : pixel(nullptr), next(nullptr) { }
 };
 
 
@@ -91,7 +92,7 @@ template <typename Float, typename Spectrum>
 class SPPMIntegrator : public Integrator<Float, Spectrum> {
 public:
     MI_IMPORT_BASE(Integrator, aov_names, should_stop, m_render_timer, m_stop)
-    MI_IMPORT_TYPES(Scene, Sensor, Sampler, Film, MediumPtr, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr)
+    MI_IMPORT_TYPES(Scene, Sensor, ImageBlock, Sampler, Film, MediumPtr, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr)
 
     using SPPMPixel = SPPMPixel<Float, Spectrum>;
     using BoundingBox2u = BoundingBox<Point2u>;
@@ -135,9 +136,17 @@ public:
         // Final result output                        
         TensorXf result;
 
+        Log(Info, "scene bounds: %s", scene->bbox());
+
         // implement only for cpu type
 if constexpr (!dr::is_jit_v<Float>) {
         // Render on the CPU using a spiral pattern
+
+        // Potentially adjust the number of samples per pixel if spp != 0
+        Sampler *sampler = sensor->sampler();
+        if (spp)
+            sampler->set_sample_count(spp);
+        spp = sampler->sample_count();
         
         Log(Info, "spp: %u", spp);
         uint32_t num_iter = spp;
@@ -148,14 +157,11 @@ if constexpr (!dr::is_jit_v<Float>) {
         if (film->sample_border())
             film_size += 2 * film->rfilter()->border_size();
 
-        // Potentially adjust the number of samples per pixel if spp != 0
-        Sampler *sampler = sensor->sampler();
-        if (spp)
-            sampler->set_sample_count(spp);
-        spp = sampler->sample_count();
+        
 
         // Determine output channels and prepare the film with this information
-        // size_t n_channels = film->prepare(aov_names());
+        // needed for developing default film
+        size_t n_channels = film->prepare(aov_names());
 
         uint32_t nPixels = film_size.x() * film_size.y();
 
@@ -199,7 +205,7 @@ if constexpr (!dr::is_jit_v<Float>) {
         ref<ProgressReporter> progress;
         Logger* logger = mitsuba::Thread::thread()->logger();
         if (logger && Info >= logger->log_level())
-            progress = new ProgressReporter("Rendering");
+            progress = new ProgressReporter("Stage1: Visible Points");
 
         // Total number of blocks to be handled, including multiple passes.
         uint32_t total_blocks = spiral.block_count() * 1,
@@ -285,6 +291,7 @@ if constexpr (!dr::is_jit_v<Float>) {
         // uint32_t hashSize = math::next_prime(nPixels);
         uint32_t hashSize = nPixels;
         std::vector<std::atomic<SPPMPixelListNode *>> grid(hashSize);
+        std::vector<std::atomic<int> > gridCounter(hashSize);
 
         // Compute grid bounds for SPPM visible points
         BoundingBox3f gridBounds;
@@ -298,13 +305,13 @@ if constexpr (!dr::is_jit_v<Float>) {
                 pixel.vp.p + Vector3f(pixel.radius)
             );
 
+            Log(Debug, "Visible point p: %s, beta: %s", pixel.vp.p, pixel.vp.beta);
+
             gridBounds.expand(vpBounds);
             maxRadius = dr::maximum(maxRadius, pixel.radius);
         }
 
-        Log(Info, "Hashing %u visible points into a %s",
-            nPixels, gridBounds
-        );
+        
 
         // std::unique_ptr<detail::OrderedChunkAllocator> threadScratchBuffer;
         detail::OrderedChunkAllocator threadScratchBuffer;
@@ -315,6 +322,10 @@ if constexpr (!dr::is_jit_v<Float>) {
         Float maxDiag = dr::max(diag);
         int baseGridRes = int(maxDiag / maxRadius);
         Point3i gridRes = dr::maximum(1,  dr::floor2int<Vector3f>(baseGridRes * diag / maxDiag));
+
+        Log(Info, "Hashing %u visible points into a %s, gridBounds: %s",
+            nPixels, gridRes, gridBounds
+        );
 
         // Add visible points to SPPM grid
         // iterate over pixels
@@ -368,6 +379,8 @@ if constexpr (!dr::is_jit_v<Float>) {
                                     // linked list
                                     node->pixel = &pixel;
 
+                                    // change the grid node counter
+                                    gridCounter[h]++;
                                     // add an entry to linked list in the SPPMNode
                                     node->next = grid[h];
                                     while (!grid[h].compare_exchange_weak(node->next, node))
@@ -383,6 +396,11 @@ if constexpr (!dr::is_jit_v<Float>) {
             }
         );
 
+        if (logger && Info >= logger->log_level())
+            progress = new ProgressReporter("Stage3: Photon Tracing");
+
+        uint32_t totalPhotonsBlocks = nPixels/8;
+        uint32_t photonBlocksDone = 0;
 
         int photonsPerIteration = nPixels;
         Log(Info, "Starting photon tracing pass, with %u photons", photonsPerIteration);
@@ -402,6 +420,8 @@ if constexpr (!dr::is_jit_v<Float>) {
                 for (size_t photonIndex = range.begin();
                     photonIndex != range.end() &&!should_stop(); ++photonIndex) {
 
+                    Log(Debug, "-- Tracing photon %u", photonIndex);
+
                     // generate photon rays
                     auto [ray, throughput] = prepare_ray(scene, sensor, sampler);
 
@@ -418,10 +438,13 @@ if constexpr (!dr::is_jit_v<Float>) {
                     if (m_max_depth >= 0)
                         active &= depth < m_max_depth;
 
-                    dr::Loop<Mask> loop("Particle Tracer Integrator", active, depth, ray,
+                    dr::Loop<Mask> loop("Photon Tracer", active, depth, ray,
                             throughput, si, eta, sampler);
                     
                     while (loop(active)) {
+
+                        Log(Debug, "+++++ Tracing photon %u depth %u, p: %s", 
+                            photonIndex, depth, si.p);
                         // contribute to visible points
                         Point3i photonGridIndex = Point3i(
                             dr::floor2int<Point3i>(gridRes * (si.p - gridBounds.min) / gridBounds.extents())
@@ -432,10 +455,18 @@ if constexpr (!dr::is_jit_v<Float>) {
                             // Compute the hash value for the grid cell
                             int h = Hash<Float>(photonGridIndex) % hashSize;
 
+                            Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, numPhotonsInCell: %u",
+                                photonIndex, depth, photonGridIndex, h, gridCounter[h].load());
+
+                            const int PhotonsInList = gridCounter[h].load();
+
+                            int photon_id = 0;
                             for(SPPMPixelListNode *node = 
                                     grid[h].load(std::memory_order_relaxed);
                                     node; node = node->next) {
-
+                                
+                                Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, photon_id: %u/%u",
+                                    photonIndex, depth, photonGridIndex, h, photon_id, PhotonsInList);
                                 SPPMPixel &pixel = *node->pixel;
                                 // not a neighbor
                                 if (dr::squared_norm(pixel.vp.p - si.p) > dr::sqr(pixel.radius))
@@ -465,8 +496,9 @@ if constexpr (!dr::is_jit_v<Float>) {
                                 pixel.PhiY += (Phi_i_Y);
                                 pixel.PhiZ += (Phi_i_Z);
                             
-                                
+                                photon_id++;
                             } // iteration over linked list end
+
                         } // inbounds check
                             
                     
@@ -516,13 +548,21 @@ if constexpr (!dr::is_jit_v<Float>) {
                             dr::masked(throughput, use_rr) *= dr::rcp(q);
                         }
 
-                    } 
+                    } // tracing loop
                     
 
                     // reset scratch space
                     // TODO: how to provide the specific pointer without keeping the list 
                     // scratchBuffer.release();
+
                 } // while loop end
+
+                /* Critical section: update progress bar */
+                if(progress) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    photonBlocksDone++;
+                    progress->update(photonBlocksDone / (Float) totalPhotonsBlocks);
+                }
 
             }
         );
@@ -606,6 +646,37 @@ if constexpr (!dr::is_jit_v<Float>) {
         // }
         auto data_ = dr::load<DynamicBuffer<ScalarFloat>>(Ld_data_.data(), nPixels*3);
         result = TensorXf(data_, 3, shape_);
+        // put in the film
+        ref<ImageBlock> block = film->create_block(film_size, false, false);
+        Log(Info, "film block numCh: %s, size: %s", 
+                block->channel_count(),
+                block->size());
+        int num_channels = block->channel_count();
+        const bool has_alpha = has_flag(film->flags(), FilmFlags::Alpha);
+
+        for (int v=0; v<film_size.y(); ++v) {
+            for (int u=0; u<film_size.x(); ++u) {
+                Float* aovs = new Float[num_channels]; 
+                const int idx = v*film_size.x() + u;
+                aovs[0] = Ld_data_.at( 3*idx + 0);
+                aovs[1] = Ld_data_.at( 3*idx + 1);
+                aovs[2] = Ld_data_.at( 3*idx + 2);
+                // Log(Debug, "(%d, %d) -> (%f, %f, %f)", u, v, aovs[0], aovs[1], aovs[2]);
+                if (has_alpha){
+                    aovs[3] = 1.0;
+                    aovs[4] = 1.0;
+                } else {
+                    aovs[3] = 1.0;
+                }
+
+                block->put(
+                    // Point2f((Float)u/(Float)film_size.x(), (Float)v/(Float)film_size.y()), 
+                    Point2f(u, v),
+                    aovs);
+            }
+        }
+        film->put_block(block);
+        // 
         return result;
 
 } else {
@@ -637,7 +708,7 @@ if constexpr (!dr::is_array_v<Float>) {
         seed += block_id * pixel_count;
 
         // Scale down ray differentials when tracing multiple rays per pixel
-        uint32_t sample_count = 1;
+        uint32_t sample_count = sampler->sample_count();
         Float diff_scale_factor = dr::rsqrt((Float) sample_count);
 
         // Determine output channels and prepare the film with this information

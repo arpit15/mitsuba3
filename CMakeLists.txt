@@ -322,7 +322,7 @@ if (MI_ENABLE_AUTODIFF)
   add_definitions(-DMI_ENABLE_AUTODIFF=1)
 endif()
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL GNU)
   # Hidden default symbol visibility issues with GCC
