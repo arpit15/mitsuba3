@@ -49,12 +49,13 @@ struct VisiblePoint {
     Point3f p;
     Vector3f wo;
     BSDFPtr bsdf;
+    SurfaceInteraction3f si;
     Spectrum beta;
     Bool secondaryLambdaTerminated;
-    VisiblePoint(const Point3f &p, const Vector3f &wo, const BSDFPtr &bsdf, const Spectrum &beta, bool secondaryLambdaTerminated)
-        : p(p), wo(wo), bsdf(bsdf), beta(beta), secondaryLambdaTerminated(secondaryLambdaTerminated) { }
+    VisiblePoint(const SurfaceInteraction3f &si, const Point3f &p, const Vector3f &wo, const BSDFPtr &bsdf, const Spectrum &beta, bool secondaryLambdaTerminated)
+        : si(si), p(p), wo(wo), bsdf(bsdf), beta(beta), secondaryLambdaTerminated(secondaryLambdaTerminated) { }
 
-    DRJIT_STRUCT(VisiblePoint, p, wo, bsdf, beta, secondaryLambdaTerminated)
+    DRJIT_STRUCT(VisiblePoint, si, p, wo, bsdf, beta, secondaryLambdaTerminated)
 };
 
 template <typename Float, typename Spectrum>
@@ -70,13 +71,14 @@ struct SPPMPixel {
     
     // TODO: how to make this atomic
     // std::atomic<Spectrum> Phi;
-    AtomicFloat<Float> PhiX, PhiY, PhiZ;
+    // AtomicFloat<Float> PhiX, PhiY, PhiZ;
+    AtomicFloat<Float> Phi_i[3];
     // TODO: how to make this atomic
     std::atomic<UInt32> M;
     Color3f tau;
     Float n = 0;
 
-    DRJIT_STRUCT(SPPMPixel, radius, Ld, vp, PhiX, PhiY, PhiZ, M, tau, n)
+    DRJIT_STRUCT(SPPMPixel, radius, Ld, vp, Phi_i, M, tau, n)
 
 };
 
@@ -158,7 +160,6 @@ if constexpr (!dr::is_jit_v<Float>) {
             film_size += 2 * film->rfilter()->border_size();
 
         
-
         // Determine output channels and prepare the film with this information
         // needed for developing default film
         size_t n_channels = film->prepare(aov_names());
@@ -182,8 +183,7 @@ if constexpr (!dr::is_jit_v<Float>) {
         }
 
         // SPPM pixels
-        Log(Info, "Starting visible point render job (%ux%u)",
-        film_size.x(), film_size.y());
+        
 
         // Create a 2D grid of SPPM pixels
         // dr::DynamicArray<SPPMPixel> pixels;
@@ -199,26 +199,35 @@ if constexpr (!dr::is_jit_v<Float>) {
         }
         
         
-        Spiral spiral(film_size, film->crop_offset(), block_size, 1);
+        
 
         std::mutex mutex;
-        ref<ProgressReporter> progress;
+        ref<ProgressReporter> progress_visible, progress_photon;
         Logger* logger = mitsuba::Thread::thread()->logger();
-        if (logger && Info >= logger->log_level())
-            progress = new ProgressReporter("Stage1: Visible Points");
+        if (logger && Info >= logger->log_level()) {
+            progress_visible = new ProgressReporter("Stage1: Visible Points");
+            progress_photon = new ProgressReporter("Stage3: Photon Tracing");
+        }
 
-        // Total number of blocks to be handled, including multiple passes.
-        uint32_t total_blocks = spiral.block_count() * 1,
-                 blocks_done = 0;
-
-        // Grain size for parallelization
-        uint32_t grain_size = std::max(total_blocks / (4 * n_threads), 1u);
+        
 
     Log(Info, "About to start the main loop for %u", num_iter);
     std::vector<ScalarFloat> Ld_data_(nPixels*3);
     // run main loop
     for(uint32_t iter=0; iter < num_iter; ++iter) {
         Log(Info, "Starting iteration %u/%u", iter + 1, num_iter);
+        
+        Spiral spiral(film_size, film->crop_offset(), block_size, 1);
+        // Total number of blocks to be handled, including multiple passes.
+        uint32_t total_blocks = spiral.block_count() * 1,
+                 blocks_done = 0;
+
+        // Grain size for parallelization
+        uint32_t grain_size = std::max(total_blocks / (4 * n_threads), 1u);
+        
+        Log(Info, "Starting visible point render job (%ux%u)",
+            film_size.x(), film_size.y());
+        progress_visible->update(0);
         // Generate SPPM visible points
         ThreadEnvironment env;
         dr::parallel_for(
@@ -249,19 +258,26 @@ if constexpr (!dr::is_jit_v<Float>) {
                         Vector2i spiral_block_size = size;
                         Vector2u spiral_block_offset = offset;
 
+                        // seeding is done in the render from camera
                         // main path tracing style step
                         render_from_camera(scene, sensor, sampler, pixels, 
                             film_size, spiral_block_size, spiral_block_offset, 
-                            seed, block_id, block_size);
+                            seed, block_id, block_size, iter);
+
+
+                        // not necessary as render_from_camera has to deal with it
+                        // update sampler state
+                        // sampler->advance();
+
                         // store result into global storage
 
                         //
                         
                         /* Critical section: update progress bar */
-                        if(progress) {
+                        if(progress_visible) {
                             std::lock_guard<std::mutex> lock(mutex);
                             blocks_done++;
-                            progress->update(blocks_done / (Float) total_blocks);
+                            progress_visible->update(blocks_done / (Float) total_blocks);
                         }
 
 
@@ -347,7 +363,7 @@ if constexpr (!dr::is_jit_v<Float>) {
                     Point2u block_px_start(px_id % film_size.x(), px_id / film_size.x());
 
                     SPPMPixel &pixel = pixels[px_id];
-                    if ( dr::mean(pixel.vp.beta)) {
+                    if ( dr::mean(pixel.vp.beta) ) {
                         // Add pixel's visible point to applicable grid cells
                         // Find grid cell bounds for pixel's visible point, _pMin_ and _pMax_
                         Float pixelRadius = pixel.radius;
@@ -396,34 +412,47 @@ if constexpr (!dr::is_jit_v<Float>) {
             }
         );
 
-        if (logger && Info >= logger->log_level())
-            progress = new ProgressReporter("Stage3: Photon Tracing");
-
-        uint32_t totalPhotonsBlocks = nPixels/8;
-        uint32_t photonBlocksDone = 0;
 
         int photonsPerIteration = nPixels;
+
+        size_t n_threads = Thread::thread_count();
+        size_t grain_size_photon = std::max(photonsPerIteration / (4 * n_threads), (size_t) 1);
+        // uint32_t totalPhotonsBlocks = nPixels/grain_size_photon;
+        // uint32_t photonBlocksDone = 0;
+        std::atomic<size_t> samples_done(0);
+
+        seed *= (uint32_t) photonsPerIteration / (uint32_t) grain_size_photon;
+        // std::atomic<size_t> samples_done(0);
+
+        Log(Info, "grain_size: %u, n_thread: %u", 
+            grain_size_photon, n_threads);
+
         Log(Info, "Starting photon tracing pass, with %u photons", photonsPerIteration);
         // Trace photons and accumulate contributions
         dr::parallel_for(
-            dr::blocked_range<size_t>(0, photonsPerIteration, 8),
+            dr::blocked_range<size_t>(0, photonsPerIteration, grain_size_photon),
             [&](const dr::blocked_range<size_t> &range) {
                 ScopedSetThreadEnvironment set_env(env);
 
                 // auto &scratchBuffer = photonShootScratchBuffers;
                 // Fork a non-overlapping sampler for the current worker
                 ref<Sampler> sampler = sensor->sampler()->clone();
+                sampler->seed(seed + 
+                    (uint32_t) range.begin() / (uint32_t) grain_size_photon);
 
                 Log(Debug, "Photon tracing from %u to %u", range.begin(), range.end());
 
+                size_t ctr = 0;
                 // process up to 'grain_size' image blocks
                 for (size_t photonIndex = range.begin();
                     photonIndex != range.end() &&!should_stop(); ++photonIndex) {
 
-                    Log(Debug, "-- Tracing photon %u", photonIndex);
+                    // Log(Debug, "-- Tracing photon %u", photonIndex);
 
                     // generate photon rays
                     auto [ray, throughput] = prepare_ray(scene, sensor, sampler);
+
+                    // Log(Debug, "ray: %s, throughput: %s", ray, throughput);
 
                     if(dr::all(throughput == 0.f))
                         continue;
@@ -443,8 +472,8 @@ if constexpr (!dr::is_jit_v<Float>) {
                     
                     while (loop(active)) {
 
-                        Log(Debug, "+++++ Tracing photon %u depth %u, p: %s", 
-                            photonIndex, depth, si.p);
+                        // Log(Debug, "+++++ Tracing photon %u depth %u, p: %s", 
+                        //     photonIndex, depth, si.p);
                         // contribute to visible points
                         Point3i photonGridIndex = Point3i(
                             dr::floor2int<Point3i>(gridRes * (si.p - gridBounds.min) / gridBounds.extents())
@@ -455,18 +484,18 @@ if constexpr (!dr::is_jit_v<Float>) {
                             // Compute the hash value for the grid cell
                             int h = Hash<Float>(photonGridIndex) % hashSize;
 
-                            Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, numPhotonsInCell: %u",
-                                photonIndex, depth, photonGridIndex, h, gridCounter[h].load());
+                            // Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, numPhotonsInCell: %u",
+                            //     photonIndex, depth, photonGridIndex, h, gridCounter[h].load());
 
                             const int PhotonsInList = gridCounter[h].load();
 
-                            int photon_id = 0;
+                            std::atomic<int> photon_id = 0;
                             for(SPPMPixelListNode *node = 
                                     grid[h].load(std::memory_order_relaxed);
                                     node; node = node->next) {
                                 
-                                Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, photon_id: %u/%u",
-                                    photonIndex, depth, photonGridIndex, h, photon_id, PhotonsInList);
+                                // Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, photon_id: %u/%u",
+                                //     photonIndex, depth, photonGridIndex, h, photon_id, PhotonsInList);
                                 SPPMPixel &pixel = *node->pixel;
                                 // not a neighbor
                                 if (dr::squared_norm(pixel.vp.p - si.p) > dr::sqr(pixel.radius))
@@ -475,15 +504,24 @@ if constexpr (!dr::is_jit_v<Float>) {
                                 // Update pixel Phi and M for nearby photon
                                 Vector3f wi = -ray.d;
                                 BSDFContext ctx;
-                                Point2f _uv(0.0, 0.0);
+                                // Point2f _uv(0.0, 0.0);
                                 // TODO: this seems wrong
-                                Normal3f _n = Normal3f(0.0, 0.0, 0.0);
-                                PositionSample3f _ps(pixel.vp.p, _n, _uv, ray.time, 0.0, false);  
-                                SurfaceInteraction3f pixel_si(_ps, ray.wavelengths);
-                                pixel_si.p = pixel.vp.p;
-                                pixel_si.wi = pixel.vp.wo;   
-                                Spectrum Phi = throughput * pixel.vp.bsdf->eval(ctx, pixel_si, wi);
+                                // Normal3f _n = Normal3f(0.0, 0.0, 0.0);
+                                // PositionSample3f _ps(pixel.vp.p, _n, _uv, ray.time, 0.0, false);  
+                                // SurfaceInteraction3f pixel_si(_ps, ray.wavelengths);
+                                // pixel_si.p = pixel.vp.p;
+                                // pixel_si.wi = pixel.vp.wo; 
+                                Vector3f wo_local = pixel.vp.si.to_local(wi);
+                                const auto bsdf_val = pixel.vp.bsdf->eval(ctx, pixel.vp.si, wo_local);  
+                                Spectrum Phi = throughput * pixel.vp.bsdf->eval(ctx, pixel.vp.si, wo_local);
 
+                                Log(Debug, "id: %u, Found a neighbor si.p: %s, vis: %s dist: %s - Phi: %s, bsdf: %s",
+                                    photonIndex,
+                                    si.p, 
+                                    pixel.vp.p, 
+                                    dr::squared_norm(pixel.vp.p - si.p),
+                                    Phi,
+                                    bsdf_val);
                                 // TODO: account for sampled wavelengths
 
                                 Spectrum Phi_i = pixel.vp.beta * Phi;
@@ -491,12 +529,11 @@ if constexpr (!dr::is_jit_v<Float>) {
                                 Float Phi_i_Y = Phi_i.y();
                                 Float Phi_i_Z = Phi_i.z();
                                 // atomic add
-                                // pixel.PhiX += Phi_i_X;
-                                pixel.PhiX += (Phi_i_X);
-                                pixel.PhiY += (Phi_i_Y);
-                                pixel.PhiZ += (Phi_i_Z);
+                                for (int i=0; i<3; ++i)
+                                    pixel.Phi_i[i] += Phi_i[i];
                             
                                 photon_id++;
+                                ++pixel.M;
                             } // iteration over linked list end
 
                         } // inbounds check
@@ -551,38 +588,51 @@ if constexpr (!dr::is_jit_v<Float>) {
                     } // tracing loop
                     
 
+                    sampler->advance();
+                    
+                    // ctr++; 
+                    // if (ctr > 10000) {
+                    //     std::lock_guard<std::mutex> lock(mutex);
+                    //     samples_done += ctr;
+                    //     ctr = 0;
+                    //     if(progress_photon)
+                    //         progress_photon->update(samples_done / (ScalarFloat) photonsPerIteration);
+                    // }
                     // reset scratch space
                     // TODO: how to provide the specific pointer without keeping the list 
                     // scratchBuffer.release();
 
                 } // while loop end
 
-                /* Critical section: update progress bar */
-                if(progress) {
+                samples_done += (range.end() - range.begin());
+
+                // locked
                     std::lock_guard<std::mutex> lock(mutex);
-                    photonBlocksDone++;
-                    progress->update(photonBlocksDone / (Float) totalPhotonsBlocks);
-                }
+                    progress_photon->update(samples_done / (ScalarFloat) photonsPerIteration);
 
             }
         );
         
+        progress_photon->update(0.0);
         // reset scratch space after tracing photons
 
 
         // update counters
         // photonPaths += photonsPerIteration;
 
+        uint32_t n_threads_ = Thread::thread_count();
+
         Log(Info, "Starting image update pass");
         // Update pixel values from this pass's photons
         dr::parallel_for(
-            dr::blocked_range<size_t>(0, nPixels, 8),
+            dr::blocked_range<size_t>(0, nPixels, n_threads_),
             [&](const dr::blocked_range<size_t> &range) {
                 ScopedSetThreadEnvironment set_env(env);
 
                 for(size_t i = range.begin(); i != range.end(); ++i) {
                     // process up to 'grain_size' image blocks
                     SPPMPixel &pixel = pixels.at(i);
+
                     if (int m = pixel.M.load(std::memory_order_relaxed); m>0) {
 
                         // Compute new photon count and search radius given photons
@@ -592,13 +642,16 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                         // Update $\tau$ for pixel
                         // Spectrum Phi_i = pixel.Phi;
-                        Color3f Phi_i(pixel.PhiX, pixel.PhiY, pixel.PhiZ);
-                        pixel.tau = (pixel.tau + Phi_i) * dr::sqrt(rNew) / dr::sqrt(pixel.radius);
+                        Color3f Phi_i(pixel.Phi_i[0], pixel.Phi_i[1], pixel.Phi_i[2]);
+                        pixel.tau = (pixel.tau + Phi_i) * dr::sqr(rNew) / dr::sqr(pixel.radius);
 
                         // // Set remaining pixel values for next photon pass
                         pixel.n = nNew;
                         pixel.radius = rNew;
                         pixel.M = 0;
+
+                        for(int i=0; i<3; ++i)
+                            pixel.Phi_i[0] = (Float)0;
                     }
 
                     // Reset _VisiblePoint_ in pixel
@@ -615,7 +668,7 @@ if constexpr (!dr::is_jit_v<Float>) {
         Log(Info, "Updating the writing of images");
         // Periodically write SPPM image to disk
         dr::parallel_for(
-            dr::blocked_range<size_t>(0, nPixels, 8),
+            dr::blocked_range<size_t>(0, nPixels, n_threads_),
             [&](const dr::blocked_range<size_t> &range) {
                 ScopedSetThreadEnvironment set_env(env);
 
@@ -623,7 +676,7 @@ if constexpr (!dr::is_jit_v<Float>) {
                     // process up to 'grain_size' image blocks
                     SPPMPixel &pixel = pixels[i];
 
-                    Color3f L = pixel.Ld / (iter + 1) + pixel.tau / (np * dr::Pi<Float> * dr::sqrt(pixel.radius));
+                    Color3f L = pixel.Ld / (iter + 1) + pixel.tau / (np * dr::Pi<Float> * dr::sqr(pixel.radius));
                     
                     Ld_data_[i*3+0] = L.x();
                     Ld_data_[i*3+1] = L.y();
@@ -694,7 +747,7 @@ if constexpr (!dr::is_jit_v<Float>) {
     void render_from_camera(const Scene *scene, const Sensor *sensor, Sampler *sampler, 
         std::vector<SPPMPixel> &block, const ScalarPoint2i film_size, 
         const Vector2i spiral_block_size, const Vector2u spiral_block_offset,
-        uint32_t seed, uint32_t block_id, uint32_t block_size) {
+        uint32_t seed, uint32_t block_id, uint32_t block_size, uint32_t iter) {
         
         // only implement for cpu type
 if constexpr (!dr::is_array_v<Float>) {
@@ -722,7 +775,13 @@ if constexpr (!dr::is_array_v<Float>) {
         // block->clear();
 
         for (uint32_t i = 0; i < pixel_count && !should_stop(); ++i) {
+            // get to the state of a pixel
             sampler->seed(seed + i);
+
+            for (uint32_t j = 0; j < iter; ++j) {
+                // get to the state of a sample
+                sampler->advance();
+            }
 
             Point2u pos = dr::morton_decode<Point2u>(i);
             if (dr::any(pos.x() >= spiral_block_size || pos.y() >= spiral_block_size))
@@ -736,7 +795,9 @@ if constexpr (!dr::is_array_v<Float>) {
                 pos_f, 
                 diff_scale_factor, true);
 
-            sampler->advance();
+            // following is not useful as I am not iterating over samples
+            // sampler->advance();
+            
         }
 
 } else {
@@ -825,10 +886,12 @@ if constexpr (!dr::is_array_v<Float>) {
         UInt32 index_flattened = dr::fmadd(p.y(), film_size.x(), p.x());
 
         Log(Debug, "Assigning Ld at position %s - %s", pos, rgb);
+
+
         // TODO: convert this to drjit operation
-        block[index_flattened].Ld.x() = rgb.x();
-        block[index_flattened].Ld.y() = rgb.y();
-        block[index_flattened].Ld.z() = rgb.z();
+        block[index_flattened].Ld.x() += rgb.x();
+        block[index_flattened].Ld.y() += rgb.y();
+        block[index_flattened].Ld.z() += rgb.z();        
         // dr::scatter(block.Ld, rgb, index_flattened, active);
 
 } else {
@@ -998,7 +1061,7 @@ if constexpr (!dr::is_array_v<Float>) {
 
             if (inactive) {
                 Log(Debug, "assigning visible point at position %s", pos);
-                block[index_flattened].vp = VisiblePoint<Float, Spectrum>(si.p, -ray.d, bsdf, throughput, false);
+                block[index_flattened].vp = VisiblePoint<Float, Spectrum>(si, si.p, -ray.d, bsdf, throughput, false);
             }
             // loop over values to change std vector
 
