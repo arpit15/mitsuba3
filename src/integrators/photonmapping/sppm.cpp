@@ -1,4 +1,7 @@
 #include <mutex>
+#include <list> 
+#include <shared_mutex>
+#include <fstream>
 
 #include <drjit/morton.h>
 #include <drjit/dynamic.h>
@@ -34,6 +37,209 @@ NAMESPACE_BEGIN(mitsuba)
 //     hashRecursiveCopy((char *)buf, args...);
 //     return MurmurHash64A((const unsigned char *)buf, sz, 0);
 // }
+
+//======================================
+#define PBRT_L1_CACHE_LINE_SIZE 64
+
+template <typename T>
+struct AllocationTraits {
+    using SingleObject = T *;
+};
+template <typename T>
+struct AllocationTraits<T[]> {
+    using Array = T *;
+};
+template <typename T, size_t n>
+struct AllocationTraits<T[n]> {
+    struct Invalid {};
+};
+
+// ScratchBuffer Definition
+class alignas(PBRT_L1_CACHE_LINE_SIZE) ScratchBuffer {
+  public:
+    // ScratchBuffer Public Methods
+    ScratchBuffer(int size = 256) : allocSize(size) {
+        // ptr = (char *)Allocator().allocate_bytes(size, align);
+        ptr = (char *)new uint8_t[size];
+    }
+
+    ScratchBuffer(const ScratchBuffer &) = delete;
+
+    ScratchBuffer(ScratchBuffer &&b) {
+        ptr = b.ptr;
+        allocSize = b.allocSize;
+        offset = b.offset;
+        smallBuffers = std::move(b.smallBuffers);
+
+        b.ptr = nullptr;
+        b.allocSize = b.offset = 0;
+    }
+
+    ~ScratchBuffer() {
+        Reset();
+        // Allocator().deallocate_bytes(ptr, allocSize, align);
+        delete[] ptr;
+    }
+
+    ScratchBuffer &operator=(const ScratchBuffer &) = delete;
+
+        ScratchBuffer &operator=(ScratchBuffer &&b) {
+        std::swap(b.ptr, ptr);
+        std::swap(b.allocSize, allocSize);
+        std::swap(b.offset, offset);
+        std::swap(b.smallBuffers, smallBuffers);
+        return *this;
+    }
+
+    void *Alloc(size_t size, size_t align) {
+        if ((offset % align) != 0)
+            offset += align - (offset % align);
+        if (offset + size > allocSize)
+            Realloc(size);
+        void *p = ptr + offset;
+        offset += size;
+        return p;
+    }
+
+    template <typename T, typename... Args>
+    typename AllocationTraits<T>::SingleObject Alloc(Args &&...args) {
+        T *p = (T *)Alloc(sizeof(T), alignof(T));
+        return new (p) T(std::forward<Args>(args)...);
+    }
+
+    template <typename T>
+    typename AllocationTraits<T>::Array Alloc(size_t n = 1) {
+        using ElementType = typename std::remove_extent_t<T>;
+        ElementType *ret =
+            (ElementType *)Alloc(n * sizeof(ElementType), alignof(ElementType));
+        for (size_t i = 0; i < n; ++i)
+            new (&ret[i]) ElementType();
+        return ret;
+    }
+
+    void Reset() {
+        for (const auto &buf : smallBuffers){
+            // Allocator().deallocate_bytes(buf.first, buf.second, align);
+            delete[] buf.first;
+        }
+        smallBuffers.clear();
+        offset = 0;
+    }
+
+  private:
+    // ScratchBuffer Private Methods
+    void Realloc(size_t minSize) {
+        smallBuffers.push_back(std::make_pair(ptr, allocSize));
+        allocSize = std::max(2 * minSize, allocSize + minSize);
+        // ptr = (char *)Allocator().allocate_bytes(allocSize, align);
+        ptr = (char *)new uint8_t[allocSize];
+        offset = 0;
+    }
+
+    // ScratchBuffer Private Members
+    static constexpr int align = PBRT_L1_CACHE_LINE_SIZE;
+    char *ptr = nullptr;
+    int allocSize = 0, offset = 0;
+    std::list<std::pair<char *, size_t>> smallBuffers;
+};
+
+int RunningThreads(){
+    return Thread::thread()->thread_count();
+}
+// =====================================
+// ThreadLocal Definition
+template <typename T>
+class ThreadLocal {
+  public:
+    // ThreadLocal Public Methods
+    ThreadLocal() : hashTable(4 * RunningThreads()), create([]() { return T(); }) {}
+    ThreadLocal(std::function<T(void)> &&c)
+        : hashTable(4 * RunningThreads()), create(c) {}
+
+    T &Get();
+
+    template <typename F>
+    void ForAll(F &&func);
+
+  private:
+    // ThreadLocal Private Members
+    struct Entry {
+        uint32_t tid;
+        T value;
+    };
+    std::shared_mutex mutex;
+    std::vector<std::optional<Entry>> hashTable;
+    std::function<T(void)> create;
+};
+
+#define CHECK_IMPL(a, b, op) assert((a)op(b))
+#define CHECK_LT(a, b) CHECK_IMPL(a, b, <)
+
+// ThreadLocal Inline Methods
+template <typename T>
+inline T &ThreadLocal<T>::Get() {
+    // std::thread::id tid = std::this_thread::get_id();
+    uint32_t tid = Thread::thread()->thread_id();
+    uint32_t hash = std::hash<uint32_t>()(tid);
+    hash %= hashTable.size();
+    int step = 1;
+    int tries = 0;
+
+    mutex.lock_shared();
+    while (true) {
+        CHECK_LT(++tries, hashTable.size());  // full hash table
+
+        if (hashTable[hash] && hashTable[hash]->tid == tid) {
+            // Found it
+            T &threadLocal = hashTable[hash]->value;
+            mutex.unlock_shared();
+            return threadLocal;
+        } else if (!hashTable[hash]) {
+            mutex.unlock_shared();
+
+            // Get reader-writer lock before calling the callback so that the user
+            // doesn't have to worry about writing a thread-safe callback.
+            mutex.lock();
+            T newItem = create();
+
+            if (hashTable[hash]) {
+                // someone else got there first--keep looking, but now
+                // with a writer lock.
+                while (true) {
+                    hash += step;
+                    ++step;
+                    if (hash >= hashTable.size())
+                        hash %= hashTable.size();
+
+                    if (!hashTable[hash])
+                        break;
+                }
+            }
+
+            hashTable[hash] = Entry{tid, std::move(newItem)};
+            T &threadLocal = hashTable[hash]->value;
+            mutex.unlock();
+            return threadLocal;
+        }
+
+        hash += step;
+        ++step;
+        if (hash >= hashTable.size())
+            hash %= hashTable.size();
+    }
+}
+
+template <typename T>
+template <typename F>
+inline void ThreadLocal<T>::ForAll(F &&func) {
+    mutex.lock();
+    for (auto &entry : hashTable) {
+        if (entry)
+            func(entry->value);
+    }
+    mutex.unlock();
+}
+// ================================================
 
 template <typename Float>
 inline uint64_t Hash(const Point<dr::int32_array_t<Float>, 3> &p) {
@@ -86,7 +292,7 @@ template <typename Float, typename Spectrum>
 struct SPPMPixelListNode {
     SPPMPixel<Float, Spectrum> *pixel;
     SPPMPixelListNode *next;
-    SPPMPixelListNode() : pixel(nullptr), next(nullptr) { }
+    // SPPMPixelListNode() : pixel(nullptr), next(nullptr) { }
 };
 
 
@@ -195,11 +401,8 @@ if constexpr (!dr::is_jit_v<Float>) {
         for(uint32_t i=0; i < nPixels; ++i) {
             // pixels[i].radius = m_initial_radius;
             // dr::slice(pixels, i).radius = m_initial_radius;
-            pixels[i].radius = m_initial_radius;
+            pixels.at(i).radius = m_initial_radius;
         }
-        
-        
-        
 
         std::mutex mutex;
         ref<ProgressReporter> progress_visible, progress_photon;
@@ -245,15 +448,12 @@ if constexpr (!dr::is_jit_v<Float>) {
                         auto [offset, size, block_id] = spiral.next_block();
                         Assert(dr::prod(size) != 0);
 
-                        Log(Debug, "Rendering block %u/%u (offset: %s, size: %s)",
-                            i + 1, total_blocks, offset, size);
+                        // Log(Debug, "Rendering block %u/%u (offset: %s, size: %s)",
+                        //     i + 1, total_blocks, offset, size);
 
                         // TODO: check if the following should be uncommented
                         // if (film->sample_border())
                         //     offset -= film->rfilter()->border_size();
-
-                        // block->set_size(size);
-                        // block->set_offset(offset);
 
                         Vector2i spiral_block_size = size;
                         Vector2u spiral_block_offset = offset;
@@ -268,10 +468,6 @@ if constexpr (!dr::is_jit_v<Float>) {
                         // not necessary as render_from_camera has to deal with it
                         // update sampler state
                         // sampler->advance();
-
-                        // store result into global storage
-
-                        //
                         
                         /* Critical section: update progress bar */
                         if(progress_visible) {
@@ -321,16 +517,28 @@ if constexpr (!dr::is_jit_v<Float>) {
                 pixel.vp.p + Vector3f(pixel.radius)
             );
 
-            Log(Debug, "Visible point p: %s, beta: %s", pixel.vp.p, pixel.vp.beta);
+            // Log(Debug, "Visible point p: %s, beta: %s", pixel.vp.p, pixel.vp.beta);
 
             gridBounds.expand(vpBounds);
             maxRadius = dr::maximum(maxRadius, pixel.radius);
         }
 
         
+        // creates a memory allocator
+        // detail::OrderedChunkAllocator threadScratchBuffer;
+        // TODO: think of a better
+        // std::vector<detail::OrderedChunkAllocator> threadScratchBuffer(n_threads);
+        // std::unordered_map<uint32_t, detail::OrderedChunkAllocator*> threadScratchBuffer;
+        
 
-        // std::unique_ptr<detail::OrderedChunkAllocator> threadScratchBuffer;
-        detail::OrderedChunkAllocator threadScratchBuffer;
+        // create scratchBuffer here
+        // for (int i=0; i<n_threads; i++){
+        //     threadScratchBuffer[i] = new detail::OrderedChunkAllocator();
+        // }
+
+        // Allocate per-thread _ScratchBuffer_s for SPPM rendering
+        ThreadLocal<ScratchBuffer> threadScratchBuffers(
+        []() { return ScratchBuffer(1024 * 1024); });
 
         // Compute resolution of SPPM grid in each dimension
         // UInt32 gridRes[3];
@@ -347,13 +555,16 @@ if constexpr (!dr::is_jit_v<Float>) {
         // iterate over pixels
         // run over rows first
         dr::parallel_for(
-            dr::blocked_range<uint32_t>(0, nPixels, 8),
+            dr::blocked_range<uint32_t>(0, nPixels, n_threads),
             [&](const dr::blocked_range<uint32_t> &range){
                 ScopedSetThreadEnvironment set_env(env);
-                // process up to 'grain_size' image blocks
-
-                // obtain pointer to scratch buffer
-                auto &scratchBuffer = threadScratchBuffer;
+    
+                // need to get a local arena which is disjoint
+                const uint32_t thread_id = Thread::thread()->thread_id();
+                // Log(Info, "Creating scratchbuffer for : %u",
+                //     thread_id);
+                // auto &scratchBuffer = *threadScratchBuffer[thread_id];
+                ScratchBuffer &scratchBuffer = threadScratchBuffers.Get();
                 // ----
 
                 for (uint32_t i = range.begin();
@@ -362,8 +573,13 @@ if constexpr (!dr::is_jit_v<Float>) {
                     uint32_t px_id = i;
                     Point2u block_px_start(px_id % film_size.x(), px_id / film_size.x());
 
-                    SPPMPixel &pixel = pixels[px_id];
-                    if ( dr::mean(pixel.vp.beta) ) {
+                    SPPMPixel &pixel = pixels.at(px_id);
+//                    Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
+//                    if (pixel.vp.p.x() != pixel.vp.p.x()) {
+//                        Log(Debug, "------- something is wrong: %s", pixel.vp.p);
+//                        Point po = pixel.vp.p;
+//                    }
+                    if ( !(pixel.vp.p.x() != pixel.vp.p.x()) && dr::mean(pixel.vp.beta) ) {
                         // Add pixel's visible point to applicable grid cells
                         // Find grid cell bounds for pixel's visible point, _pMin_ and _pMax_
                         Float pixelRadius = pixel.radius;
@@ -391,14 +607,19 @@ if constexpr (!dr::is_jit_v<Float>) {
                                     // Add visible point to grid cell $(x, y, z)$
                                     int h = Hash<Float>(Point3i(x, y, z)) % hashSize;
                                     // allocate nodes using global memory so that they don't vanish when the loop ends
-                                    SPPMPixelListNode *node = scratchBuffer.allocate<SPPMPixelListNode>(1);
+                                    SPPMPixelListNode *node = scratchBuffer.Alloc<SPPMPixelListNode>();
                                     // linked list
+                                    Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
+                                    if (pixel.vp.p.x() != pixel.vp.p.x()) {
+                                        Log(Debug, "------- something is wrong: %s", pixel.vp.p);
+                                        Point po = pixel.vp.p;
+                                    }
                                     node->pixel = &pixel;
 
                                     // change the grid node counter
                                     gridCounter[h]++;
                                     // add an entry to linked list in the SPPMNode
-                                    node->next = grid[h];
+                                    node->next = grid[h].load(std::memory_order_relaxed);
                                     while (!grid[h].compare_exchange_weak(node->next, node))
                                         ;
                                 }
@@ -411,6 +632,38 @@ if constexpr (!dr::is_jit_v<Float>) {
                 }
             }
         );
+
+        // debug linked list data
+        // write a csv
+        std::ofstream photon_map;
+        photon_map.open("photon_map.csv");
+        for (int kk=0; kk<grid.size(); kk++) {
+            photon_map << kk << "," << gridCounter.at(kk) << ",";
+            int bb = 0;
+            for(SPPMPixelListNode *node = 
+                                    grid[kk].load(std::memory_order_relaxed);
+                                    node; node = node->next) {
+
+                Log(Debug, "%u/%u grid cell, %u/%u, pixel p:%s",
+                    kk, grid.size(),
+                    bb, gridCounter.at(kk),
+                    node->pixel->vp.p);
+
+                if (bb > (gridCounter.at(kk)-1) ) {
+                    Log(Debug, "Problem -- %u/%u", bb, gridCounter.at(kk));
+//                    asm("int $3");
+                }
+                photon_map <<   node->pixel->vp.p.x() << ","
+                            <<  node->pixel->vp.p.y() << ","
+                            <<  node->pixel->vp.p.z() << ",";
+                photon_map.flush();
+                bb++;
+            } 
+            photon_map << std::endl;
+        }
+        photon_map.close();
+
+        // -------
 
 
         int photonsPerIteration = nPixels;
@@ -428,6 +681,8 @@ if constexpr (!dr::is_jit_v<Float>) {
             grain_size_photon, n_threads);
 
         Log(Info, "Starting photon tracing pass, with %u photons", photonsPerIteration);
+
+        std::atomic<int> numHits = 0;
         // Trace photons and accumulate contributions
         dr::parallel_for(
             dr::blocked_range<size_t>(0, photonsPerIteration, grain_size_photon),
@@ -437,10 +692,12 @@ if constexpr (!dr::is_jit_v<Float>) {
                 // auto &scratchBuffer = photonShootScratchBuffers;
                 // Fork a non-overlapping sampler for the current worker
                 ref<Sampler> sampler = sensor->sampler()->clone();
-                sampler->seed(seed + 
-                    (uint32_t) range.begin() / (uint32_t) grain_size_photon);
 
-                Log(Debug, "Photon tracing from %u to %u", range.begin(), range.end());
+                // this will not account for iter
+                // sampler->seed(seed + 
+                //     (uint32_t) range.begin() / (uint32_t) grain_size_photon);
+
+                // Log(Debug, "Photon tracing from %u to %u", range.begin(), range.end());
 
                 size_t ctr = 0;
                 // process up to 'grain_size' image blocks
@@ -448,6 +705,9 @@ if constexpr (!dr::is_jit_v<Float>) {
                     photonIndex != range.end() &&!should_stop(); ++photonIndex) {
 
                     // Log(Debug, "-- Tracing photon %u", photonIndex);
+
+                    sampler->seed(seed + 
+                        (uint32_t)iter * (uint32_t)photonsPerIteration + photonIndex);
 
                     // generate photon rays
                     auto [ray, throughput] = prepare_ray(scene, sensor, sampler);
@@ -489,13 +749,17 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                             const int PhotonsInList = gridCounter[h].load();
 
-                            std::atomic<int> photon_id = 0;
+                            int photon_id = 0;
+                            // node is not a nullptr even at the end; Maybe this is causing nodes into a invalid state
                             for(SPPMPixelListNode *node = 
                                     grid[h].load(std::memory_order_relaxed);
                                     node; node = node->next) {
                                 
-                                // Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, photon_id: %u/%u",
-                                //     photonIndex, depth, photonGridIndex, h, photon_id, PhotonsInList);
+                                if (photon_id >= PhotonsInList)
+                                    Log(Debug, "->->->->->-> PI:%u D:%u, visible_id: %u/%u, next(Null):%u",
+                                        photonIndex, depth, photon_id, PhotonsInList, node->next==nullptr);
+                                
+                                photon_id++;
                                 SPPMPixel &pixel = *node->pixel;
                                 // not a neighbor
                                 if (dr::squared_norm(pixel.vp.p - si.p) > dr::sqr(pixel.radius))
@@ -503,25 +767,21 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                                 // Update pixel Phi and M for nearby photon
                                 Vector3f wi = -ray.d;
-                                BSDFContext ctx;
-                                // Point2f _uv(0.0, 0.0);
-                                // TODO: this seems wrong
-                                // Normal3f _n = Normal3f(0.0, 0.0, 0.0);
-                                // PositionSample3f _ps(pixel.vp.p, _n, _uv, ray.time, 0.0, false);  
-                                // SurfaceInteraction3f pixel_si(_ps, ray.wavelengths);
-                                // pixel_si.p = pixel.vp.p;
-                                // pixel_si.wi = pixel.vp.wo; 
+                                BSDFContext ctx; 
                                 Vector3f wo_local = pixel.vp.si.to_local(wi);
                                 const auto bsdf_val = pixel.vp.bsdf->eval(ctx, pixel.vp.si, wo_local);  
                                 Spectrum Phi = throughput * pixel.vp.bsdf->eval(ctx, pixel.vp.si, wo_local);
 
-                                Log(Debug, "id: %u, Found a neighbor si.p: %s, vis: %s dist: %s - Phi: %s, bsdf: %s",
+                                Log(Debug, "PhotonId: %u, depth %u (%u/%u)Found a neighbor si.p: %s, dist: %s - Phi: %s, bsdf: %s",
                                     photonIndex,
+                                    depth,
+                                    photon_id, PhotonsInList,
                                     si.p, 
-                                    pixel.vp.p, 
                                     dr::squared_norm(pixel.vp.p - si.p),
                                     Phi,
                                     bsdf_val);
+
+                                numHits++;
                                 // TODO: account for sampled wavelengths
 
                                 Spectrum Phi_i = pixel.vp.beta * Phi;
@@ -532,10 +792,11 @@ if constexpr (!dr::is_jit_v<Float>) {
                                 for (int i=0; i<3; ++i)
                                     pixel.Phi_i[i] += Phi_i[i];
                             
-                                photon_id++;
+                                
                                 ++pixel.M;
                             } // iteration over linked list end
-
+                        //    Log(Debug, "````````Linked loop done for photon %u, depth: %u!`````````", 
+                        //             photonIndex, depth);
                         } // inbounds check
                             
                     
@@ -590,18 +851,6 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                     sampler->advance();
                     
-                    // ctr++; 
-                    // if (ctr > 10000) {
-                    //     std::lock_guard<std::mutex> lock(mutex);
-                    //     samples_done += ctr;
-                    //     ctr = 0;
-                    //     if(progress_photon)
-                    //         progress_photon->update(samples_done / (ScalarFloat) photonsPerIteration);
-                    // }
-                    // reset scratch space
-                    // TODO: how to provide the specific pointer without keeping the list 
-                    // scratchBuffer.release();
-
                 } // while loop end
 
                 samples_done += (range.end() - range.begin());
@@ -612,10 +861,19 @@ if constexpr (!dr::is_jit_v<Float>) {
 
             }
         );
+
+        Log(Debug, "Numhits: %u", numHits);
         
         progress_photon->update(0.0);
         // reset scratch space after tracing photons
-
+        // threadScratchBuffers.clear();
+        // for(auto& thread_id: threadScratchBuffer) {
+        //     threadScratchBuffer[thread_id].release();
+        // }
+        threadScratchBuffers.ForAll([](ScratchBuffer &buffer) { 
+            // TODO: free all chunks
+            buffer.Reset(); 
+        });
 
         // update counters
         // photonPaths += photonsPerIteration;
@@ -752,8 +1010,8 @@ if constexpr (!dr::is_jit_v<Float>) {
         // only implement for cpu type
 if constexpr (!dr::is_array_v<Float>) {
 
-        Log(Debug, "--- Rendering block %u/%u (offset: %s, size: %s)",
-            block_id + 1, block.size(), spiral_block_offset, spiral_block_size);
+        // Log(Debug, "--- Rendering block %u/%u (offset: %s, size: %s)",
+        //     block_id + 1, block.size(), spiral_block_offset, spiral_block_size);
         
         // Render a single block of the image
         uint32_t pixel_count = block_size * block_size;
@@ -819,7 +1077,7 @@ if constexpr (!dr::is_array_v<Float>) {
         // only implement for cpu type
 if constexpr (!dr::is_array_v<Float>) {
 
-        Log(Debug, "Rendering sample at position %s", pos);
+        // Log(Debug, "Rendering sample at position %s", pos);
 
         const Film *film = sensor->film();
         // const bool has_alpha = has_flag(film->flags(), FilmFlags::Alpha);
@@ -861,7 +1119,7 @@ if constexpr (!dr::is_array_v<Float>) {
             active);
         // 
 
-        Log(Debug, "Obtained spectrum %s, ray_weight: %s", spec, ray_weight);
+        // Log(Debug, "Obtained spectrum %s, ray_weight: %s", spec, ray_weight);
         UnpolarizedSpectrum spec_u = unpolarized_spectrum(ray_weight * spec);
 
         Spectrum rgb = spec_u;
@@ -885,7 +1143,7 @@ if constexpr (!dr::is_array_v<Float>) {
         Point2u p = Point2u(dr::floor2int<Point2i>(pos));
         UInt32 index_flattened = dr::fmadd(p.y(), film_size.x(), p.x());
 
-        Log(Debug, "Assigning Ld at position %s - %s", pos, rgb);
+        // Log(Debug, "Assigning Ld at position %s - %s", pos, rgb);
 
 
         // TODO: convert this to drjit operation
@@ -912,7 +1170,7 @@ if constexpr (!dr::is_array_v<Float>) {
                // only implement for cpu type
 if constexpr (!dr::is_array_v<Float>) {
 
-    Log(Debug, "Sampling ray at position %s", pos);
+    // Log(Debug, "Sampling ray at position %s", pos);
 
     // final quantity assignment 
     Point2u pos_u = Point2u(dr::floor2int<Point2i>(pos));
@@ -958,6 +1216,7 @@ if constexpr (!dr::is_array_v<Float>) {
                 scene->ray_intersect(ray,
                                      /* ray_flags = */ +RayFlags::All,
                                      /* coherent = */ dr::eq(depth, 0u));
+
 
             // Log(Debug, "Obtained surface interaction");
             // ---------------------- Direct emission ----------------------
@@ -1054,14 +1313,23 @@ if constexpr (!dr::is_array_v<Float>) {
             }
 
             // assign visible point here
-            Log(Debug, "light sampling result: %s", result);
+            // Log(Debug, "light sampling result: %s", result);
             // dr::scatter(block.vp, 
             //     VisiblePoint(si.p, -ray.d, bsdf, throughput, false)
             //     , index_flattened, inactive);
 
             if (inactive) {
-                Log(Debug, "assigning visible point at position %s", pos);
-                block[index_flattened].vp = VisiblePoint<Float, Spectrum>(si, si.p, -ray.d, bsdf, throughput, false);
+                 Log(Debug, "assigning visible point at position %s", si.p);
+                 Point3f curr_p = si.p;
+                 float curr_px = curr_p.x(),
+                       curr_py = curr_p.y(),
+                       curr_pz = curr_p.z();
+
+                 if (curr_px != curr_px || curr_py != curr_py || curr_pz != curr_pz) {
+                     Log(Debug, "--- problem invalid point: %s", si.p);
+                     break;
+                 }
+                block.at(index_flattened).vp = VisiblePoint<Float, Spectrum>(si, si.p, -ray.d, bsdf, throughput, false);
             }
             // loop over values to change std vector
 
@@ -1072,7 +1340,7 @@ if constexpr (!dr::is_array_v<Float>) {
 
 
             if(dr::none_or<true>(notSetVisiblePoint)){
-                Log(Debug, "Visible point set Ld: %s, valid_ray: %s", result, valid_ray);
+                // Log(Debug, "Visible point set Ld: %s, valid_ray: %s", result, valid_ray);
                 break;
             }
 
@@ -1103,7 +1371,7 @@ if constexpr (!dr::is_array_v<Float>) {
     // assign 
     // dr::scatter(block.Ld, rgb, index_flattened, active);
     
-    Log(Debug, "Done sampling ray at position %s - %s", pos, result);
+    // Log(Debug, "Done sampling ray at position %s - %s", pos, result);
     return {
             /* spec  = */ dr::select(valid_ray, result, 0.f),
             /* valid = */ valid_ray
