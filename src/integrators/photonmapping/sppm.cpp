@@ -439,7 +439,7 @@ if constexpr (!dr::is_jit_v<Float>) {
                 ScopedSetThreadEnvironment set_env(env);
 
                 // Fork a non-overlapping sampler for the current worker
-                ref<Sampler> sampler = sensor->sampler()->fork();
+                ref<Sampler> local_sampler = sensor->sampler()->fork();
 
                 // Render up to 'grain_size' image blocks
                 for (uint32_t i = range.begin();
@@ -460,7 +460,7 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                         // seeding is done in the render from camera
                         // main path tracing style step
-                        render_from_camera(scene, sensor, sampler, pixels, 
+                        render_from_camera(scene, sensor, local_sampler, pixels,
                             film_size, spiral_block_size, spiral_block_offset, 
                             seed, block_id, block_size, iter);
 
@@ -554,114 +554,170 @@ if constexpr (!dr::is_jit_v<Float>) {
         // Add visible points to SPPM grid
         // iterate over pixels
         // run over rows first
-        dr::parallel_for(
-            dr::blocked_range<uint32_t>(0, nPixels, n_threads),
-            [&](const dr::blocked_range<uint32_t> &range){
-                ScopedSetThreadEnvironment set_env(env);
+//         dr::parallel_for(
+//             dr::blocked_range<uint32_t>(0, nPixels, n_threads),
+//             [&](const dr::blocked_range<uint32_t> &range){
+//                 ScopedSetThreadEnvironment set_env(env);
     
-                // need to get a local arena which is disjoint
-                const uint32_t thread_id = Thread::thread()->thread_id();
-                // Log(Info, "Creating scratchbuffer for : %u",
-                //     thread_id);
-                // auto &scratchBuffer = *threadScratchBuffer[thread_id];
-                ScratchBuffer &scratchBuffer = threadScratchBuffers.Get();
-                // ----
+//                 // need to get a local arena which is disjoint
+//                 const uint32_t thread_id = Thread::thread()->thread_id();
+//                 // Log(Info, "Creating scratchbuffer for : %u",
+//                 //     thread_id);
+//                 // auto &scratchBuffer = *threadScratchBuffer[thread_id];
+//                 ScratchBuffer &scratchBuffer = threadScratchBuffers.Get();
+//                 // ----
 
-                for (uint32_t i = range.begin();
-                    i != range.end() &&!should_stop(); ++i) {
+//                 for (uint32_t i = range.begin();
+//                     i != range.end() &&!should_stop(); ++i) {
                         
-                    uint32_t px_id = i;
-                    Point2u block_px_start(px_id % film_size.x(), px_id / film_size.x());
+//                     uint32_t px_id = i;
+//                     Point2u block_px_start(px_id % film_size.x(), px_id / film_size.x());
 
-                    SPPMPixel &pixel = pixels.at(px_id);
-//                    Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
-//                    if (pixel.vp.p.x() != pixel.vp.p.x()) {
-//                        Log(Debug, "------- something is wrong: %s", pixel.vp.p);
-//                        Point po = pixel.vp.p;
-//                    }
-                    if ( !(pixel.vp.p.x() != pixel.vp.p.x()) && dr::mean(pixel.vp.beta) ) {
-                        // Add pixel's visible point to applicable grid cells
-                        // Find grid cell bounds for pixel's visible point, _pMin_ and _pMax_
-                        Float pixelRadius = pixel.radius;
-                        // Point3i pMin, pMax;
-                        // find the grid cell where vp - r and vp + r are located
-                        Point3f vp_min = pixel.vp.p - Vector3f(pixelRadius),
-                            vp_max = pixel.vp.p + Vector3f(pixelRadius);
-                        
-
-                        vp_min = (vp_min - gridBounds.min) / gridBounds.extents();
-                        vp_max = (vp_max - gridBounds.min) / gridBounds.extents();
-
-                        Point3i pMin = dr::clamp(
-                            dr::floor2int<Point3i>(gridRes * vp_min), 
-                            Point3i(0), gridRes);
-
-                        Point3i pMax = dr::clamp(
-                            dr::floor2int<Point3i>(gridRes * vp_max), 
-                            Point3i(0), gridRes);
-
-                        // loop over all the grid cells and splat by looping over
-                        for (int z = pMin.z(); z <= pMax.z(); ++z) { 
-                            for (int y = pMin.y(); y <= pMax.y(); ++y) { 
-                                for (int x = pMin.x(); x <= pMax.x(); ++x) {
-                                    // Add visible point to grid cell $(x, y, z)$
-                                    int h = Hash<Float>(Point3i(x, y, z)) % hashSize;
-                                    // allocate nodes using global memory so that they don't vanish when the loop ends
-                                    SPPMPixelListNode *node = scratchBuffer.Alloc<SPPMPixelListNode>();
-                                    // linked list
-                                    Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
-                                    if (pixel.vp.p.x() != pixel.vp.p.x()) {
-                                        Log(Debug, "------- something is wrong: %s", pixel.vp.p);
-                                        Point po = pixel.vp.p;
-                                    }
-                                    node->pixel = &pixel;
-
-                                    // change the grid node counter
-                                    gridCounter[h]++;
-                                    // add an entry to linked list in the SPPMNode
-                                    node->next = grid[h].load(std::memory_order_relaxed);
-                                    while (!grid[h].compare_exchange_weak(node->next, node))
-                                        ;
-                                }
-                            }
-                        }
+//                     SPPMPixel &pixel = pixels.at(px_id);
+// //                    Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
+// //                    if (pixel.vp.p.x() != pixel.vp.p.x()) {
+// //                        Log(Debug, "------- something is wrong: %s", pixel.vp.p);
+// //                        Point po = pixel.vp.p;
+// //                    }
+//                     if ( !(pixel.vp.p.x() != pixel.vp.p.x()) && dr::mean(pixel.vp.beta) ) {
+//                         // Add pixel's visible point to applicable grid cells
+//                         // Find grid cell bounds for pixel's visible point, _pMin_ and _pMax_
+//                         Float pixelRadius = pixel.radius;
+//                         // Point3i pMin, pMax;
+//                         // find the grid cell where vp - r and vp + r are located
+//                         Point3f vp_min = pixel.vp.p - Vector3f(pixelRadius),
+//                             vp_max = pixel.vp.p + Vector3f(pixelRadius);
                         
 
-                    }
+//                         vp_min = (vp_min - gridBounds.min) / gridBounds.extents();
+//                         vp_max = (vp_max - gridBounds.min) / gridBounds.extents();
+
+//                         Point3i pMin = dr::clamp(
+//                             dr::floor2int<Point3i>(gridRes * vp_min), 
+//                             Point3i(0), gridRes);
+
+//                         Point3i pMax = dr::clamp(
+//                             dr::floor2int<Point3i>(gridRes * vp_max), 
+//                             Point3i(0), gridRes);
+
+//                         // loop over all the grid cells and splat by looping over
+//                         for (int z = pMin.z(); z <= pMax.z(); ++z) { 
+//                             for (int y = pMin.y(); y <= pMax.y(); ++y) { 
+//                                 for (int x = pMin.x(); x <= pMax.x(); ++x) {
+//                                     // Add visible point to grid cell $(x, y, z)$
+//                                     int h = Hash<Float>(Point3i(x, y, z)) % hashSize;
+//                                     // allocate nodes using global memory so that they don't vanish when the loop ends
+//                                     SPPMPixelListNode *node = scratchBuffer.Alloc<SPPMPixelListNode>();
+//                                     // linked list
+//                                     Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
+//                                     if (pixel.vp.p.x() != pixel.vp.p.x()) {
+//                                         Log(Debug, "------- something is wrong: %s", pixel.vp.p);
+//                                         Point po = pixel.vp.p;
+//                                     }
+//                                     node->pixel = &pixel;
+
+//                                     // change the grid node counter
+//                                     gridCounter[h]++;
+//                                     // add an entry to linked list in the SPPMNode
+//                                     node->next = grid[h].load(std::memory_order_relaxed);
+//                                     while (!grid[h].compare_exchange_weak(node->next, node))
+//                                         ;
+//                                 }
+//                             }
+//                         }
+                        
+
+//                     }
             
-                }
-            }
-        );
+//                 }
+//             }
+//         );
 
+        // ---
+        // write a serial version of grid splatting
+        ScratchBuffer &myScratchBuffer = threadScratchBuffers.Get();
+        for (uint32_t px_id = 0 ; px_id<nPixels; px_id++) {
+            Point2u block_px_start(px_id % film_size.x(), px_id / film_size.x());
+            SPPMPixel &pixel = pixels.at(px_id);
+            if ( !(pixel.vp.p.x() != pixel.vp.p.x()) && dr::mean(pixel.vp.beta) ) {
+                // Add pixel's visible point to applicable grid cells
+                // Find grid cell bounds for pixel's visible point, _pMin_ and _pMax_
+                Float pixelRadius = pixel.radius;
+                // Point3i pMin, pMax;
+                // find the grid cell where vp - r and vp + r are located
+                Point3f vp_min = pixel.vp.p - Vector3f(pixelRadius),
+                    vp_max = pixel.vp.p + Vector3f(pixelRadius);
+                
+                vp_min = (vp_min - gridBounds.min) / gridBounds.extents();
+                vp_max = (vp_max - gridBounds.min) / gridBounds.extents();
+
+                Point3i pMin = dr::clamp(
+                    dr::floor2int<Point3i>(gridRes * vp_min), 
+                    Point3i(0), gridRes);
+
+                Point3i pMax = dr::clamp(
+                    dr::floor2int<Point3i>(gridRes * vp_max), 
+                    Point3i(0), gridRes);
+
+                // loop over all the grid cells and splat by looping over
+                for (int z = pMin.z(); z <= pMax.z(); ++z) { 
+                    for (int y = pMin.y(); y <= pMax.y(); ++y) { 
+                        for (int x = pMin.x(); x <= pMax.x(); ++x) {
+                            // Add visible point to grid cell $(x, y, z)$
+                            int h = Hash<Float>(Point3i(x, y, z)) % hashSize;
+                            // allocate nodes using global memory so that they don't vanish when the loop ends
+                            SPPMPixelListNode *node = myScratchBuffer.Alloc<SPPMPixelListNode>();
+                            // linked list
+                            Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
+                            if (pixel.vp.p.x() != pixel.vp.p.x()) {
+                                Log(Debug, "------- something is wrong: %s", pixel.vp.p);
+                                Point po = pixel.vp.p;
+                            }
+                            node->pixel = &pixel;
+
+                            // change the grid node counter
+                            gridCounter[h]++;
+                            // add an entry to linked list in the SPPMNode
+                            node->next = grid[h].load(std::memory_order_relaxed);
+                            while (!grid[h].compare_exchange_weak(node->next, node))
+                                ;
+
+
+                        }
+                    }
+                }
+            } // end pixel check if
+        } // end of pixel for loop
+        // ---
         // debug linked list data
         // write a csv
-        std::ofstream photon_map;
-        photon_map.open("photon_map.csv");
-        for (int kk=0; kk<grid.size(); kk++) {
-            photon_map << kk << "," << gridCounter.at(kk) << ",";
-            int bb = 0;
-            for(SPPMPixelListNode *node = 
-                                    grid[kk].load(std::memory_order_relaxed);
-                                    node; node = node->next) {
-
-                Log(Debug, "%u/%u grid cell, %u/%u, pixel p:%s",
-                    kk, grid.size(),
-                    bb, gridCounter.at(kk),
-                    node->pixel->vp.p);
-
-                if (bb > (gridCounter.at(kk)-1) ) {
-                    Log(Debug, "Problem -- %u/%u", bb, gridCounter.at(kk));
-//                    asm("int $3");
-                }
-                photon_map <<   node->pixel->vp.p.x() << ","
-                            <<  node->pixel->vp.p.y() << ","
-                            <<  node->pixel->vp.p.z() << ",";
-                photon_map.flush();
-                bb++;
-            } 
-            photon_map << std::endl;
-        }
-        photon_map.close();
+//         std::ofstream photon_map;
+//         photon_map.open("photon_map.csv");
+//         for (int kk=0; kk<grid.size(); kk++) {
+//             photon_map << kk << "," << gridCounter.at(kk) << ",";
+//             int bb = 0;
+//             for(SPPMPixelListNode *node =
+//                                     grid[kk].load(std::memory_order_relaxed);
+//                                     node; node = node->next) {
+//
+//                 Log(Debug, "%u/%u grid cell, %u/%u, pixel p:%s",
+//                     kk, grid.size(),
+//                     bb, gridCounter.at(kk),
+//                     node->pixel->vp.p);
+//
+//                 if (bb > (gridCounter.at(kk)-1) ) {
+//                     Log(Debug, "Problem -- %u/%u", bb, gridCounter.at(kk));
+// //                    asm("int $3");
+//                 }
+//                 photon_map <<   node->pixel->vp.p.x() << ","
+//                             <<  node->pixel->vp.p.y() << ","
+//                             <<  node->pixel->vp.p.z() << ",";
+//                 photon_map.flush();
+//                 bb++;
+//             }
+//             photon_map << std::endl;
+//         }
+//         photon_map.close();
 
         // -------
 
@@ -691,13 +747,13 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                 // auto &scratchBuffer = photonShootScratchBuffers;
                 // Fork a non-overlapping sampler for the current worker
-                ref<Sampler> sampler = sensor->sampler()->clone();
+                ref<Sampler> local_sampler = sensor->sampler()->clone();
 
                 // this will not account for iter
                 // sampler->seed(seed + 
                 //     (uint32_t) range.begin() / (uint32_t) grain_size_photon);
 
-                // Log(Debug, "Photon tracing from %u to %u", range.begin(), range.end());
+                Log(Debug, "Photon tracing from %u to %u", range.begin(), range.end());
 
                 size_t ctr = 0;
                 // process up to 'grain_size' image blocks
@@ -706,11 +762,11 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                     // Log(Debug, "-- Tracing photon %u", photonIndex);
 
-                    sampler->seed(seed + 
+                    local_sampler->seed(seed +
                         (uint32_t)iter * (uint32_t)photonsPerIteration + photonIndex);
 
                     // generate photon rays
-                    auto [ray, throughput] = prepare_ray(scene, sensor, sampler);
+                    auto [ray, throughput] = prepare_ray(scene, sensor, local_sampler);
 
                     // Log(Debug, "ray: %s, throughput: %s", ray, throughput);
 
@@ -806,8 +862,8 @@ if constexpr (!dr::is_jit_v<Float>) {
                         BSDFPtr bsdf = si.bsdf(ray);
                         BSDFContext ctx(TransportMode::Importance);
                         auto [bs, bsdf_val] =
-                            bsdf->sample(ctx, si, sampler->next_1d(active),
-                                        sampler->next_2d(active), active);
+                            bsdf->sample(ctx, si, local_sampler->next_1d(active),
+                                        local_sampler->next_2d(active), active);
 
                         // Using geometric normals (wo points to the camera)
                         Float wi_dot_geo_n = dr::dot(si.n, -ray.d),
@@ -842,14 +898,14 @@ if constexpr (!dr::is_jit_v<Float>) {
                         if (dr::any_or<true>(use_rr)) {
                             Float q = dr::minimum(
                                 dr::max(unpolarized_spectrum(throughput)) * dr::sqr(eta), 0.95f);
-                            dr::masked(active, use_rr) &= sampler->next_1d(active) < q;
+                            dr::masked(active, use_rr) &= local_sampler->next_1d(active) < q;
                             dr::masked(throughput, use_rr) *= dr::rcp(q);
                         }
 
                     } // tracing loop
                     
 
-                    sampler->advance();
+                    local_sampler->advance();
                     
                 } // while loop end
 
@@ -870,10 +926,10 @@ if constexpr (!dr::is_jit_v<Float>) {
         // for(auto& thread_id: threadScratchBuffer) {
         //     threadScratchBuffer[thread_id].release();
         // }
-        threadScratchBuffers.ForAll([](ScratchBuffer &buffer) { 
-            // TODO: free all chunks
-            buffer.Reset(); 
-        });
+        // threadScratchBuffers.ForAll([](ScratchBuffer &buffer) {
+        //     // TODO: free all chunks
+        //     buffer.Reset();
+        // });
 
         // update counters
         // photonPaths += photonsPerIteration;
@@ -891,7 +947,7 @@ if constexpr (!dr::is_jit_v<Float>) {
                     // process up to 'grain_size' image blocks
                     SPPMPixel &pixel = pixels.at(i);
 
-                    if (int m = pixel.M.load(std::memory_order_relaxed); m>0) {
+                    if (int m = pixel.M.load(std::memory_order_relaxed); m>0 && !(pixel.vp.p.x() != pixel.vp.p.x())) {
 
                         // Compute new photon count and search radius given photons
                         Float gamma = (Float)2 / (Float)3;
@@ -908,7 +964,7 @@ if constexpr (!dr::is_jit_v<Float>) {
                         pixel.radius = rNew;
                         pixel.M = 0;
 
-                        for(int i=0; i<3; ++i)
+                        for(int pp=0; pp<3; ++pp)
                             pixel.Phi_i[0] = (Float)0;
                     }
 
@@ -932,7 +988,7 @@ if constexpr (!dr::is_jit_v<Float>) {
 
                 for(size_t i = range.begin(); i != range.end(); ++i) {
                     // process up to 'grain_size' image blocks
-                    SPPMPixel &pixel = pixels[i];
+                    SPPMPixel &pixel = pixels.at(i);
 
                     Color3f L = pixel.Ld / (iter + 1) + pixel.tau / (np * dr::Pi<Float> * dr::sqr(pixel.radius));
                     
@@ -972,7 +1028,7 @@ if constexpr (!dr::is_jit_v<Float>) {
                 aovs[0] = Ld_data_.at( 3*idx + 0);
                 aovs[1] = Ld_data_.at( 3*idx + 1);
                 aovs[2] = Ld_data_.at( 3*idx + 2);
-                // Log(Debug, "(%d, %d) -> (%f, %f, %f)", u, v, aovs[0], aovs[1], aovs[2]);
+                Log(Debug, "(%d, %d) -> (%f, %f, %f)", u, v, aovs[0], aovs[1], aovs[2]);
                 if (has_alpha){
                     aovs[3] = 1.0;
                     aovs[4] = 1.0;
