@@ -9,7 +9,6 @@
 #include <mitsuba/core/atomic.h>
 #include <mitsuba/core/progress.h>
 #include <mitsuba/core/fwd.h>
-#include <mitsuba/render/kdtree.h>
 #include <mitsuba/core/spectrum.h>
 #include <mitsuba/core/util.h>
 #include <mitsuba/render/bsdf.h>
@@ -21,22 +20,6 @@
 #include <nanothread/nanothread.h>
 
 NAMESPACE_BEGIN(mitsuba)
-
-// template <typename T, typename... Args>
-// inline void hashRecursiveCopy(char *buf, T v, Args... args) {
-//     memcpy(buf, &v, sizeof(T));
-//     hashRecursiveCopy(buf + sizeof(T), args...);
-// }
-
-// template <typename... Args>
-// inline uint64_t Hash(Args... args) {
-//     // C++, you never cease to amaze: https://stackoverflow.com/a/57246704
-//     constexpr size_t sz = (sizeof(Args) + ... + 0);
-//     constexpr size_t n = (sz + 7) / 8;
-//     uint64_t buf[n];
-//     hashRecursiveCopy((char *)buf, args...);
-//     return MurmurHash64A((const unsigned char *)buf, sz, 0);
-// }
 
 //======================================
 #define PBRT_L1_CACHE_LINE_SIZE 64
@@ -55,6 +38,8 @@ struct AllocationTraits<T[n]> {
 };
 
 // ScratchBuffer Definition
+// alignas helps to prevent false sharing cache misses
+// https://youtu.be/BP6NxVxDQIs?si=eBacfOW4zYwV5Xpo&t=2889
 class alignas(PBRT_L1_CACHE_LINE_SIZE) ScratchBuffer {
   public:
     // ScratchBuffer Public Methods
@@ -312,7 +297,7 @@ public:
         m_block_size = props.get<uint32_t>("block_size", 0);
         m_max_depth = props.get<uint32_t>("max_depth", 5);
         m_rr_depth = props.get<uint32_t>("rr_depth", 5);
-        m_initial_radius = props.get<float>("initial_radius", 1.f);
+        m_initial_radius = props.get<float>("initial_radius", 0.f);
     }
 
     std::pair<Ray3f, Spectrum> prepare_ray(const Scene *scene,
@@ -345,6 +330,15 @@ public:
         TensorXf result;
 
         Log(Info, "scene bounds: %s", scene->bbox());
+
+        auto bbox = scene->bbox();
+        ScalarFloat scene_radius = dr::norm(bbox.max - bbox.min) / 2;
+        Film *film = sensor->film();
+        ScalarVector2u film_size = film->crop_size();
+
+        if (m_initial_radius == 0.f) {
+            m_initial_radius = 5 * std::min(scene_radius/film_size.x(), scene_radius/film_size.y());
+        }
 
         // implement only for cpu type
 if constexpr (!dr::is_jit_v<Float>) {
@@ -821,6 +815,14 @@ if constexpr (!dr::is_jit_v<Float>) {
                                 if (dr::squared_norm(pixel.vp.p - si.p) > dr::sqr(pixel.radius))
                                     continue;
 
+                                // check if this photon is close to desired pixel
+                                auto &desired_pixel = pixels.at(150*film_size.x() + 100);
+
+                                if (dr::squared_norm(pixel.vp.p - desired_pixel.vp.p) < dr::sqr(pixel.radius)){
+                                    Log(Info, "----> BOOM! Hit my pixel");
+                                }
+                                    
+
                                 // Update pixel Phi and M for nearby photon
                                 Vector3f wi = -ray.d;
                                 BSDFContext ctx; 
@@ -947,6 +949,11 @@ if constexpr (!dr::is_jit_v<Float>) {
                     // process up to 'grain_size' image blocks
                     SPPMPixel &pixel = pixels.at(i);
 
+                    if (i == (150*film_size.x() + 100)) {
+                        Log(Info, "Pixel (%u,%u), m: %f, p: %s",
+                            i%film_size.x(), i/film_size.x(), pixel.M, pixel.vp.p);
+                    }
+
                     if (int m = pixel.M.load(std::memory_order_relaxed); m>0 && !(pixel.vp.p.x() != pixel.vp.p.x())) {
 
                         // Compute new photon count and search radius given photons
@@ -989,6 +996,12 @@ if constexpr (!dr::is_jit_v<Float>) {
                 for(size_t i = range.begin(); i != range.end(); ++i) {
                     // process up to 'grain_size' image blocks
                     SPPMPixel &pixel = pixels.at(i);
+
+                    // 100, 150
+                    if (i == (150*film_size.x() + 100)) {
+                        Log(Info, "Pixel (%u,%u), Ld: %f, tau: %f",
+                            i%film_size.x(), i/film_size.x(), pixel.Ld, pixel.tau);
+                    }
 
                     Color3f L = pixel.Ld / (iter + 1) + pixel.tau / (np * dr::Pi<Float> * dr::sqr(pixel.radius));
                     
