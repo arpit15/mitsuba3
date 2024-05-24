@@ -288,17 +288,13 @@ struct SPPMPixel
     using VisiblePoint = VisiblePoint<Float, Spectrum>;
 
     Float radius = 0.f;
-    Color3f Ld;
+    Color3f Ld = 0.f;
 
     VisiblePoint vp;
 
-    // TODO: how to make this atomic
-    // std::atomic<Spectrum> Phi;
-    // AtomicFloat<Float> PhiX, PhiY, PhiZ;
     AtomicFloat<Float> Phi_i[3];
-    // TODO: how to make this atomic
     std::atomic<UInt32> M;
-    Color3f tau;
+    Color3f tau = 0.f;
     Float n = 0;
 
     DRJIT_STRUCT(SPPMPixel, radius, Ld, vp, Phi_i, M, tau, n)
@@ -309,7 +305,6 @@ struct SPPMPixelListNode
 {
     SPPMPixel<Float, Spectrum> *pixel;
     SPPMPixelListNode *next;
-    // SPPMPixelListNode() : pixel(nullptr), next(nullptr) { }
 };
 
 template <typename Float, typename Spectrum>
@@ -322,8 +317,6 @@ public:
     using SPPMPixel = SPPMPixel<Float, Spectrum>;
     using BoundingBox2u = BoundingBox<Point2u>;
     using SPPMPixelListNode = SPPMPixelListNode<Float, Spectrum>;
-    // using Hash = Hash<Float>;
-    // using DynamicArray = dr::DynamicArray<Float>;
 
     SPPMIntegrator(const Properties &props) : Base(props)
     {
@@ -379,8 +372,6 @@ public:
         // implement only for cpu type
         if constexpr (!dr::is_jit_v<Float>)
         {
-            // Render on the CPU using a spiral pattern
-
             // Potentially adjust the number of samples per pixel if spp != 0
             Sampler *sampler = sensor->sampler();
             if (spp)
@@ -389,7 +380,6 @@ public:
 
             Log(Info, "spp: %u", spp);
             uint32_t num_iter = spp;
-            // const Float invSqrtSPP = Float(1.0) / std::sqrt(spp);
 
             Film *film = sensor->film();
             ScalarVector2u film_size = film->crop_size();
@@ -514,24 +504,7 @@ public:
                     } // lambda end
                 ); // parallel_for end
 
-                // DEBUG: output Ld
-                // size_t shape[3] = { film_size.y(), film_size.x(), 3};
-                // // TODO: convert to dynamicArray
-                // // result = TensorXf(pixels.Ld , 3, shape);
-                // std::vector<ScalarFloat> Ld_data(nPixels*3);
-                // for(uint32_t i=0; i < nPixels; ++i) {
-                //     Ld_data[i*3] = pixels[i].Ld.x();
-                //     Ld_data[i*3+1] = pixels[i].Ld.y();
-                //     Ld_data[i*3+2] = pixels[i].Ld.z();
-                // }
-                // auto data = dr::load<DynamicBuffer<ScalarFloat>>(Ld_data.data(), nPixels*3);
-                // result = TensorXf(data, 3, shape);
-                // return result;
-                // ----- end of debug
-
-                // Create grid of all SPPM visible points
                 // Allocate grid for SPPM visible points
-                // uint32_t hashSize = math::next_prime(nPixels);
                 uint32_t hashSize = nPixels;
                 std::vector<std::atomic<SPPMPixelListNode *>> grid(hashSize);
                 std::vector<std::atomic<int>> gridCounter(hashSize);
@@ -654,20 +627,12 @@ public:
                 ScratchBuffer &myScratchBuffer = threadScratchBuffers.Get();
                 for (uint32_t px_id = 0; px_id < nPixels; px_id++)
                 {
-                    // DONOT remove: the following code does some magic and sppm works because of it
-                    Point2u block_px_start(px_id % film_size.x(), px_id / film_size.x());
-
-                    if (block_px_start.x() == 256 && block_px_start.y() == 256)
-                    {
-                        Log(Info, "Splatting (256,256)");
-                    }
                     SPPMPixel &pixel = pixels.at(px_id);
                     if (!(pixel.vp.p.x() != pixel.vp.p.x()) && dr::mean(pixel.vp.beta))
                     {
                         // Add pixel's visible point to applicable grid cells
                         // Find grid cell bounds for pixel's visible point, _pMin_ and _pMax_
                         Float pixelRadius = pixel.radius;
-                        // Point3i pMin, pMax;
                         // find the grid cell where vp - r and vp + r are located
                         Point3f vp_min = pixel.vp.p - Vector3f(pixelRadius),
                                 vp_max = pixel.vp.p + Vector3f(pixelRadius);
@@ -691,32 +656,25 @@ public:
                                 for (int xx = pMin.x(); xx <= pMax.x(); ++xx)
                                 {
                                     // DONOT remove: the following code does some magic and sppm works because of it
-                                    if (block_px_start.x() == 256 && block_px_start.y() == 256)
-                                    {
-                                        Log(Info, "Adding to grid: (%u, %u, %u)", xx, yy, zz);
-                                    }
+                                    // Log(Trace, "magic line %u", xx);
+                                    // =====
                                     // Add visible point to grid cell $(x, y, z)$
-                                    int h = Hash<Float>(Point3i(xx, yy, zz)) % hashSize;
+                                    const Point3i grid_p(xx, yy, zz);
+                                    int hh = Hash<Float>(grid_p) % hashSize;
                                     // allocate nodes using global memory so that they don't vanish when the loop ends
                                     SPPMPixelListNode *node = myScratchBuffer.Alloc<SPPMPixelListNode>();
                                     // linked list
-                                    // Log(Debug, "Adding pixel with pos: %s", pixel.vp.p);
-                                    if (pixel.vp.p.x() != pixel.vp.p.x())
-                                    {
-                                        Log(Debug, "------- something is wrong: %s", pixel.vp.p);
-                                        Point po = pixel.vp.p;
-                                    }
                                     node->pixel = &pixel;
-
                                     // change the grid node counter
-                                    gridCounter[h]++;
+                                    gridCounter[hh]++;
                                     // add an entry to linked list in the SPPMNode
-                                    node->next = grid[h].load(std::memory_order_relaxed);
-                                    while (!grid[h].compare_exchange_weak(node->next, node))
-                                        ;
-                                }
-                            }
-                        }
+                                    node->next = grid[hh].load(std::memory_order_relaxed);
+                                    while (!grid[hh].compare_exchange_weak(node->next, node))
+                                    {
+                                    }
+                                } // end xx
+                            } // end yy
+                        } // end zz
                     } // end pixel check if
                 } // end of pixel for loop
 
@@ -724,18 +682,14 @@ public:
 
                 size_t n_threads = Thread::thread_count();
                 size_t grain_size_photon = std::max(photonsPerIteration / (4 * n_threads), (size_t)1);
-                // uint32_t totalPhotonsBlocks = nPixels/grain_size_photon;
-                // uint32_t photonBlocksDone = 0;
-                std::atomic<size_t> samples_done(0);
 
-                // seed *= (uint32_t)photonsPerIteration / (uint32_t)grain_size_photon;
+                std::atomic<size_t> samples_done(0);
 
                 Log(Debug, "grain_size: %u, n_thread: %u",
                     grain_size_photon, n_threads);
 
                 Log(Info, "Starting photon tracing pass, with %u photons", photonsPerIteration);
 
-                std::atomic<int> numHits = 0;
                 // Trace photons and accumulate contributions
                 dr::parallel_for(
                     dr::blocked_range<size_t>(0, photonsPerIteration, grain_size_photon),
@@ -743,7 +697,6 @@ public:
                     {
                         ScopedSetThreadEnvironment set_env(env);
 
-                        // auto &scratchBuffer = photonShootScratchBuffers;
                         // Fork a non-overlapping sampler for the current worker
                         ref<Sampler> local_sampler = sensor->sampler()->clone();
 
@@ -753,26 +706,20 @@ public:
 
                         Log(Debug, "Photon tracing from %u to %u", range.begin(), range.end());
 
-                        size_t ctr = 0;
                         // process up to 'grain_size' image blocks
                         for (size_t photonIndex = range.begin();
                              photonIndex != range.end() && !should_stop(); ++photonIndex)
                         {
-
-                            // Log(Debug, "-- Tracing photon %u", photonIndex);
 
                             local_sampler->seed(seed +
                                                 (uint32_t)iter * (uint32_t)photonsPerIteration + photonIndex);
 
                             // generate photon rays
                             auto [ray, throughput] = prepare_ray(scene, sensor, local_sampler);
-
-                            // Log(Debug, "ray: %s, throughput: %s", ray, throughput);
-
                             if (dr::all(throughput == 0.f))
                                 continue;
-                            // Follow photon path through scene and record intersections
 
+                            // Follow photon path through scene and record intersections
                             Float eta(1.f);
                             Int32 depth = 1;
                             Mask active = true;
@@ -787,9 +734,6 @@ public:
 
                             while (loop(active))
                             {
-
-                                // Log(Debug, "+++++ Tracing photon %u depth %u, p: %s",
-                                //     photonIndex, depth, si.p);
                                 // contribute to visible points
                                 Point3i photonGridIndex = Point3i(
                                     dr::floor2int<Point3i>(gridRes * (si.p - gridBounds.min) / gridBounds.extents()));
@@ -799,10 +743,6 @@ public:
                                 {
                                     // Compute the hash value for the grid cell
                                     int h = Hash<Float>(photonGridIndex) % hashSize;
-
-                                    // Log(Debug, "+++++ Photon %u depth %u, grid index: %s, hash: %u, numPhotonsInCell: %u",
-                                    //     photonIndex, depth, photonGridIndex, h, gridCounter[h].load());
-
                                     const int PhotonsInList = gridCounter[h].load();
 
                                     int photon_id = 0;
@@ -822,51 +762,21 @@ public:
                                         if (dr::squared_norm(pixel.vp.p - si.p) > dr::sqr(pixel.radius))
                                             continue;
 
-                                        // check if this photon is close to desired pixel
-                                        auto &desired_pixel = pixels.at(6 * film_size.x() + 6);
-
-                                        if (dr::squared_norm(pixel.vp.p - desired_pixel.vp.p) < dr::sqr(pixel.radius))
-                                        {
-                                            //     Log(Info, "----> BOOM! Hit desired pixel gridID: %s, si.p: %s, (vp.p:%s) at  in photon tracing",
-                                            //         photonGridIndex, desired_pixel.vp.si.p, desired_pixel.vp.p);
-                                            ++numHits;
-                                        }
-
                                         // Update pixel Phi and M for nearby photon
                                         Vector3f wi = -ray.d;
                                         BSDFContext ctx;
                                         Vector3f wo_local = pixel.vp.si.to_local(wi);
                                         Spectrum Phi = throughput * pixel.vp.bsdf->eval(ctx, pixel.vp.si, wo_local);
 
-                                        // if (dr::squared_norm(pixel.vp.p - desired_pixel.vp.p) < dr::sqr(pixel.radius) && dr::any(Phi > 0.0))
-                                        // {
-                                        //     const auto bsdf_val = pixel.vp.bsdf->eval(ctx, pixel.vp.si, wo_local);
-                                        //     Log(Info, "hitid: %u, PhotonId: %u, depth %u (%u/%u)Found a neighbor si.p: %s, dist: %s - Phi: %s, bsdf: %s",
-                                        //         numHits,
-                                        //         photonIndex,
-                                        //         depth,
-                                        //         photon_id, PhotonsInList,
-                                        //         si.p,
-                                        //         dr::squared_norm(pixel.vp.p - si.p),
-                                        //         Phi,
-                                        //         bsdf_val);
-                                        // }
-
-                                        // numHits++;
                                         // TODO: account for sampled wavelengths
-
                                         Spectrum Phi_i = pixel.vp.beta * Phi;
-                                        Float Phi_i_X = Phi_i.x();
-                                        Float Phi_i_Y = Phi_i.y();
-                                        Float Phi_i_Z = Phi_i.z();
                                         // atomic add
                                         for (int i = 0; i < 3; ++i)
                                             pixel.Phi_i[i] += Phi_i[i];
 
                                         ++pixel.M;
                                     } // iteration over linked list end
-                                    //    Log(Debug, "````````Linked loop done for photon %u, depth: %u!`````````",
-                                    //             photonIndex, depth);
+
                                 } // inbounds check
 
                                 // continue tracing or decide to close some off
@@ -1042,15 +952,10 @@ public:
                         aovs[3] = 1.0;
                     }
 
-                    block->put(
-                        // Point2f((Float)u/(Float)film_size.x(), (Float)v/(Float)film_size.y()),
-                        Point2f(u, v),
-                        aovs);
+                    block->put(Point2f(u, v), aovs);
                 }
             }
             film->put_block(block);
-            //
-            // return result;
         }
         else
         {
@@ -1191,7 +1096,6 @@ public:
 
             Point2u p = Point2u(dr::floor2int<Point2i>(pos));
             UInt32 index_flattened = dr::fmadd(p.y(), film_size.x(), p.x());
-
             block[index_flattened].Ld *= ray_weight;
         }
         else
@@ -1365,16 +1269,8 @@ public:
                     pixel.Ld += throughput * bsdf_val * em_weight * mis_em;
                 }
 
-                // assign visible point here
-                // Log(Debug, "light sampling result: %s", result);
-                // dr::scatter(block.vp,
-                //     VisiblePoint(si.p, -ray.d, bsdf, throughput, false)
-                //     , index_flattened, inactive);
-
                 if (inactive)
                 {
-                    if (pos_u.x() == 256 && pos_u.y() == 256)
-                        Log(Info, "assigning visible point at position %s isDiffuse: %u", si.p, IsDiffuse * 1.0);
                     Point3f curr_p = si.p;
                     float curr_px = curr_p.x(),
                           curr_py = curr_p.y(),
