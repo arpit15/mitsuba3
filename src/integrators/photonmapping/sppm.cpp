@@ -321,9 +321,12 @@ public:
     SPPMIntegrator(const Properties &props) : Base(props)
     {
         m_block_size = props.get<uint32_t>("block_size", 0);
+
         m_max_depth = props.get<uint32_t>("max_depth", 5);
-        m_rr_depth = props.get<uint32_t>("rr_depth", 5);
+        m_photon_count = props.get<uint32_t>("photon_count", 2500000);
         m_initial_radius = props.get<float>("initial_radius", 0.f);
+        m_alpha = props.get<float>("alpha", 2.f/3.f);
+        m_rr_depth = props.get<uint32_t>("rr_depth", 5);
     }
 
     std::pair<Ray3f, Spectrum> prepare_ray(const Scene *scene,
@@ -679,6 +682,8 @@ public:
                 } // end of pixel for loop
 
                 int photonsPerIteration = nPixels;
+                if (m_photon_count > 0)
+                    photonsPerIteration = m_photon_count;
 
                 size_t n_threads = Thread::thread_count();
                 size_t grain_size_photon = std::max(photonsPerIteration / (4 * n_threads), (size_t)1);
@@ -872,7 +877,8 @@ public:
                             {
 
                                 // Compute new photon count and search radius given photons
-                                Float gamma = (Float)2 / (Float)3;
+                                // Float gamma = (Float)2 / (Float)3;
+                                Float gamma = m_alpha;
                                 Float nNew = pixel.n + gamma * m;
                                 Float rNew = pixel.radius * dr::sqrt(nNew / (pixel.n + m));
 
@@ -1363,8 +1369,9 @@ private:
     /// Size of (square) image blocks to render in parallel (in scalar mode)
     uint32_t m_block_size;
     uint32_t m_max_depth,
-        m_rr_depth;
+        m_rr_depth, m_photon_count;
     ScalarFloat m_initial_radius;
+    ScalarFloat m_alpha;
 };
 
 MI_IMPLEMENT_CLASS_VARIANT(SPPMIntegrator, Integrator)
