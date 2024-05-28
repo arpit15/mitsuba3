@@ -125,8 +125,9 @@ endif()
 
 if (NOT Python_EXECUTABLE)
   # We require Python for the next step, even if Python bindings are deactivated
-  find_package(Python COMPONENTS Interpreter REQUIRED)
+  find_package(Python 3.11 COMPONENTS Interpreter REQUIRED)
 endif()
+message(STATUS "Mitsuba: using Python ${Python_VERSION}")
 
 execute_process(
   COMMAND ${Python_EXECUTABLE}
