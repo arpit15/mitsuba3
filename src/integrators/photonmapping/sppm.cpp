@@ -323,7 +323,7 @@ public:
         m_block_size = props.get<uint32_t>("block_size", 0);
 
         m_max_depth = props.get<uint32_t>("max_depth", 5);
-        m_photon_count = props.get<uint32_t>("photon_count", 2500000);
+        m_photon_count = props.get<uint32_t>("photon_count", 250000);
         m_initial_radius = props.get<float>("initial_radius", 0.f);
         m_alpha = props.get<float>("alpha", 2.f / 3.f);
         m_rr_depth = props.get<uint32_t>("rr_depth", 5);
