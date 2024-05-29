@@ -1057,10 +1057,6 @@ public:
         {
 
             // Log(Info, "Rendering sample at position %s", pos);
-
-            if (pos.x() == 256 && pos.y() == 256)
-                Log(Info, "=> BOOM!");
-
             const Film *film = sensor->film();
             // const bool has_alpha = has_flag(film->flags(), FilmFlags::Alpha);
             // const bool box_filter = film->rfilter()->is_box_filter();
