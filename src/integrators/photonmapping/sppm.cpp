@@ -268,12 +268,12 @@ struct VisiblePoint
 
     MI_IMPORT_TYPES(BSDFPtr)
 
-    Point3f p;
-    Vector3f wo;
-    BSDFPtr bsdf;
-    SurfaceInteraction3f si;
-    Spectrum beta;
-    Bool secondaryLambdaTerminated;
+    Point3f p = dr::zeros<Point3f>();
+    Vector3f wo = dr::zeros<Vector3f>();
+    BSDFPtr bsdf = dr::zeros<BSDFPtr>();
+    SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
+    Spectrum beta = dr::zeros<Spectrum>();
+    Bool secondaryLambdaTerminated = false;
     VisiblePoint(const SurfaceInteraction3f &si, const Point3f &p, const Vector3f &wo, const BSDFPtr &bsdf, const Spectrum &beta, bool secondaryLambdaTerminated)
         : si(si), p(p), wo(wo), bsdf(bsdf), beta(beta), secondaryLambdaTerminated(secondaryLambdaTerminated) {}
 
@@ -287,15 +287,15 @@ struct SPPMPixel
     MI_IMPORT_TYPES()
     using VisiblePoint = VisiblePoint<Float, Spectrum>;
 
-    Float radius = 0.f;
-    Color3f Ld = 0.f;
+    Float radius = dr::zeros<Float>();
+    Color3f Ld = dr::zeros<Color3f>();
 
     VisiblePoint vp;
 
     AtomicFloat<Float> Phi_i[3];
     std::atomic<UInt32> M;
-    Color3f tau = 0.f;
-    Float n = 0;
+    Color3f tau = dr::zeros<Color3f>();
+    Float n = dr::zeros<Float>();
 
     DRJIT_STRUCT(SPPMPixel, radius, Ld, vp, Phi_i, M, tau, n)
 };
@@ -325,7 +325,7 @@ public:
         m_max_depth = props.get<uint32_t>("max_depth", 5);
         m_photon_count = props.get<uint32_t>("photon_count", 2500000);
         m_initial_radius = props.get<float>("initial_radius", 0.f);
-        m_alpha = props.get<float>("alpha", 2.f/3.f);
+        m_alpha = props.get<float>("alpha", 2.f / 3.f);
         m_rr_depth = props.get<uint32_t>("rr_depth", 5);
     }
 
@@ -513,8 +513,8 @@ public:
                 std::vector<std::atomic<int>> gridCounter(hashSize);
 
                 // Compute grid bounds for SPPM visible points
-                BoundingBox3f gridBounds;
-                Float maxRadius = 0.f;
+                BoundingBox3f gridBounds = dr::zeros<BoundingBox3f>();
+                Float maxRadius = dr::zeros<Float>();
                 for (const auto &pixel : pixels)
                 {
                     if (!dr::mean(pixel.vp.beta))
