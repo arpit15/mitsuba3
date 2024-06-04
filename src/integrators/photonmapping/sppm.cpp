@@ -7,6 +7,7 @@
 #include <drjit/dynamic.h>
 
 #include <mitsuba/core/atomic.h>
+#include <mitsuba/core/hash.h>
 #include <mitsuba/core/progress.h>
 #include <mitsuba/core/fwd.h>
 #include <mitsuba/core/spectrum.h>
@@ -256,9 +257,11 @@ inline void ThreadLocal<T>::ForAll(F &&func)
 // ================================================
 
 template <typename Float>
-inline uint64_t Hash(const Point<dr::int32_array_t<Float>, 3> &p)
+inline size_t Hash(const Point<dr::int32_array_t<Float>, 3> &p)
 {
-    return ((p.x() * 73856093) ^ (p.y() * 19349663) ^ (p.z() * 83492791));
+    // return ((p.x() * 73856093) ^ (p.y() * 19349663) ^ (p.z() * 83492791));
+    std::vector<int> v = {p.x(), p.y(), p.z()};
+    return hash(v);
 }
 
 // SPPMPixel
@@ -322,8 +325,14 @@ public:
     {
         m_block_size = props.get<uint32_t>("block_size", 0);
 
-        m_max_depth = props.get<uint32_t>("max_depth", 5);
-        m_photon_count = props.get<uint32_t>("photon_count", 250000);
+        // m_max_depth = props.get<uint32_t>("max_depth", 5);
+        int max_depth = props.get<int>("max_depth", -1);
+        if (max_depth < 0 && max_depth != -1)
+            Throw("\"max_depth\" must be set to -1 (infinite) or a value >= 0");
+
+        m_max_depth = (uint32_t) max_depth; // This maps -1 to 2^32-1 bounces
+
+        m_photon_count = props.get<uint32_t>("photon_count", 0);
         m_initial_radius = props.get<float>("initial_radius", 0.f);
         m_alpha = props.get<float>("alpha", 2.f / 3.f);
         m_rr_depth = props.get<uint32_t>("rr_depth", 5);
@@ -455,7 +464,9 @@ public:
 
                 Log(Info, "Starting visible point render job (%ux%u)",
                     film_size.x(), film_size.y());
-                progress_visible->update(0);
+
+                if (progress_visible)
+                    progress_visible->update(0);
                 // Generate SPPM visible points
                 ThreadEnvironment env;
                 dr::parallel_for(
@@ -841,10 +852,12 @@ public:
 
                         // locked
                         std::lock_guard<std::mutex> lock(mutex);
-                        progress_photon->update(samples_done / (ScalarFloat)photonsPerIteration);
+                        if (progress_photon)
+                            progress_photon->update(samples_done / (ScalarFloat)photonsPerIteration);
                     });
 
-                progress_photon->update(0.0);
+                if (progress_photon)
+                    progress_photon->update(0.0);
                 // reset scratch space after tracing photons
                 // threadScratchBuffers.clear();
                 // for(auto& thread_id: threadScratchBuffer) {
