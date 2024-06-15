@@ -2,6 +2,7 @@
 #include <list>
 #include <shared_mutex>
 #include <fstream>
+#include <optional>
 
 #include <drjit/morton.h>
 #include <drjit/dynamic.h>
@@ -288,12 +289,12 @@ struct SPPMPixel
 {
 
     MI_IMPORT_TYPES()
-    using VisiblePoint = VisiblePoint<Float, Spectrum>;
+    // using VisiblePoint = VisiblePoint<Float, Spectrum>;
 
     Float radius = dr::zeros<Float>();
     Color3f Ld = dr::zeros<Color3f>();
 
-    VisiblePoint vp;
+    VisiblePoint<Float, Spectrum> vp;
 
     AtomicFloat<Float> Phi_i[3];
     std::atomic<UInt32> M;
@@ -317,9 +318,9 @@ public:
     MI_IMPORT_BASE(Integrator, aov_names, should_stop, m_render_timer, m_stop)
     MI_IMPORT_TYPES(Scene, Sensor, ImageBlock, Sampler, Film, MediumPtr, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr)
 
-    using SPPMPixel = SPPMPixel<Float, Spectrum>;
+    // using SPPMPixel = SPPMPixel<Float, Spectrum>;
     using BoundingBox2u = BoundingBox<Point2u>;
-    using SPPMPixelListNode = SPPMPixelListNode<Float, Spectrum>;
+    // using SPPMPixelListNode = SPPMPixelListNode<Float, Spectrum>;
 
     SPPMIntegrator(const Properties &props) : Base(props)
     {
@@ -428,7 +429,7 @@ public:
             // dr::DynamicArray<SPPMPixel> pixels;
             // dr::set_slices(pixels, nPixels);
             // unclear how to allocate memory for SPPMPixel vector
-            std::vector<SPPMPixel> pixels(nPixels);
+            std::vector<SPPMPixel<Float, Spectrum>> pixels(nPixels);
 
             // assign radius
             for (uint32_t i = 0; i < nPixels; ++i)
@@ -520,7 +521,7 @@ public:
 
                 // Allocate grid for SPPM visible points
                 uint32_t hashSize = nPixels;
-                std::vector<std::atomic<SPPMPixelListNode *>> grid(hashSize);
+                std::vector<std::atomic<SPPMPixelListNode<Float, Spectrum> *>> grid(hashSize);
                 std::vector<std::atomic<int>> gridCounter(hashSize);
 
                 // Compute grid bounds for SPPM visible points
@@ -641,7 +642,7 @@ public:
                 ScratchBuffer &myScratchBuffer = threadScratchBuffers.Get();
                 for (uint32_t px_id = 0; px_id < nPixels; px_id++)
                 {
-                    SPPMPixel &pixel = pixels.at(px_id);
+                    SPPMPixel<Float, Spectrum> &pixel = pixels.at(px_id);
                     if (!(pixel.vp.p.x() != pixel.vp.p.x()) && dr::mean(pixel.vp.beta))
                     {
                         // Add pixel's visible point to applicable grid cells
@@ -676,7 +677,7 @@ public:
                                     const Point3i grid_p(xx, yy, zz);
                                     int hh = Hash<Float>(grid_p) % hashSize;
                                     // allocate nodes using global memory so that they don't vanish when the loop ends
-                                    SPPMPixelListNode *node = myScratchBuffer.Alloc<SPPMPixelListNode>();
+                                    SPPMPixelListNode<Float, Spectrum> *node = myScratchBuffer.Alloc<SPPMPixelListNode<Float, Spectrum>>();
                                     // linked list
                                     node->pixel = &pixel;
                                     // change the grid node counter
@@ -763,7 +764,7 @@ public:
 
                                     int photon_id = 0;
                                     // node is not a nullptr even at the end; Maybe this is causing nodes into a invalid state
-                                    for (SPPMPixelListNode *node =
+                                    for (SPPMPixelListNode<Float, Spectrum> *node =
                                              grid[h].load(std::memory_order_relaxed);
                                          node; node = node->next)
                                     {
@@ -773,7 +774,7 @@ public:
                                                 photonIndex, depth, photon_id, PhotonsInList, node->next == nullptr);
 
                                         photon_id++;
-                                        SPPMPixel &pixel = *node->pixel;
+                                        SPPMPixel<Float, Spectrum> &pixel = *node->pixel;
                                         // not a neighbor
                                         if (dr::squared_norm(pixel.vp.p - si.p) > dr::sqr(pixel.radius))
                                             continue;
@@ -884,7 +885,7 @@ public:
                         for (size_t i = range.begin(); i != range.end(); ++i)
                         {
                             // process up to 'grain_size' image blocks
-                            SPPMPixel &pixel = pixels.at(i);
+                            SPPMPixel<Float, Spectrum> &pixel = pixels.at(i);
 
                             if (int m = pixel.M.load(std::memory_order_relaxed); m > 0 && !(pixel.vp.p.x() != pixel.vp.p.x()))
                             {
@@ -931,7 +932,7 @@ public:
                         for (size_t i = range.begin(); i != range.end(); ++i)
                         {
                             // process up to 'grain_size' image blocks
-                            SPPMPixel &pixel = pixels.at(i);
+                            SPPMPixel<Float, Spectrum> &pixel = pixels.at(i);
 
                             Color3f L = pixel.Ld / (iter + 1) + pixel.tau / (Np * dr::Pi<Float> * dr::sqr(pixel.radius));
 
@@ -990,7 +991,7 @@ public:
 
     void
     render_from_camera(const Scene *scene, const Sensor *sensor, Sampler *sampler,
-                       std::vector<SPPMPixel> &block, const ScalarPoint2i film_size,
+                       std::vector<SPPMPixel<Float, Spectrum>> &block, const ScalarPoint2i film_size,
                        const Vector2i spiral_block_size, const Vector2u spiral_block_offset,
                        uint32_t seed, uint32_t block_id, uint32_t block_size, uint32_t iter, uint32_t total_iters)
     {
@@ -1057,7 +1058,7 @@ public:
     void render_sample(const Scene *scene,
                        const Sensor *sensor,
                        Sampler *sampler,
-                       std::vector<SPPMPixel> &block,
+                       std::vector<SPPMPixel<Float, Spectrum>> &block,
                        const ScalarPoint2i film_size,
                        Float * /*aovs*/,
                        const Vector2f pos, // global coordinate into array2d
@@ -1123,7 +1124,7 @@ public:
     std::pair<Spectrum, Mask> sample(const Scene *scene, Sampler *sampler,
                                      const RayDifferential3f &ray_, const MediumPtr & /*medium*/,
                                      Float * /*aovs*/,
-                                     std::vector<SPPMPixel> &block,
+                                     std::vector<SPPMPixel<Float, Spectrum>> &block,
                                      const ScalarPoint2i film_size,
                                      const Vector2f pos, // global coordinate into array2d
                                      Mask active) const
@@ -1140,7 +1141,7 @@ public:
             // scatter values into block
             UInt32 index_flattened = dr::fmadd(pos_u.y(), film_size.x(), pos_u.x());
 
-            SPPMPixel &pixel = block.at(index_flattened);
+            SPPMPixel<Float, Spectrum> &pixel = block.at(index_flattened);
 
             if (unlikely(m_max_depth == 0))
                 return {0.f, false};
